@@ -2,8 +2,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iterator>
 #include <limits>
+#include <mutex>
+#include <utility>
 
 #include "async_jobs.h"
 #include "common/common.h"
@@ -13,6 +19,7 @@
 namespace fs = std::filesystem;
 
 static constexpr uint32_t k_max_upscale_dimension = 8192;
+static constexpr std::size_t k_max_webui_settings_size = 1024 * 1024;
 
 static bool valid_upscale_dimensions(const sd_image_t& image, int factor, int repeats) {
     if (image.width == 0 || image.height == 0 || factor < 1 || repeats < 1 || repeats > 4) {
@@ -98,12 +105,21 @@ static fs::path resolve_display_model_path(const ServerRuntime& runtime) {
     return {};
 }
 
-static json make_sample_params_json(const sd_sample_params_t& sample_params, const std::vector<int>& skip_layers) {
+static json make_sample_params_json(const sd_sample_params_t& sample_params,
+                                    const std::vector<int>& skip_layers,
+                                    const std::vector<float>* custom_sigmas = nullptr) {
     const auto& guidance = sample_params.guidance;
+    json custom_sigmas_json = json::array();
+    if (custom_sigmas != nullptr) {
+        for (float sigma : *custom_sigmas) {
+            custom_sigmas_json.push_back(sigma);
+        }
+    }
     return {
         {"scheduler", capability_scheduler_name(sample_params.scheduler)},
         {"sample_method", capability_sample_method_name(sample_params.sample_method)},
         {"sample_steps", sample_params.sample_steps},
+        {"custom_sigmas", custom_sigmas_json},
         {"eta", finite_number_or_null(sample_params.eta)},
         {"shifted_timestep", sample_params.shifted_timestep},
         {"flow_shift", finite_number_or_null(sample_params.flow_shift)},
@@ -153,7 +169,7 @@ static json make_img_gen_defaults_json(const SDGenerationParams& defaults, const
         {"increase_ref_index", defaults.increase_ref_index},
         {"control_strength", defaults.control_strength},
         {"ip_adapter_strength", defaults.ip_adapter_strength},
-        {"sample_params", make_sample_params_json(defaults.sample_params, defaults.skip_layers)},
+        {"sample_params", make_sample_params_json(defaults.sample_params, defaults.skip_layers, &defaults.custom_sigmas)},
         {"hires", make_hires_json(defaults)},
         {"vae_tiling_params", make_vae_tiling_json(defaults.vae_tiling_params)},
         {"cache_mode", defaults.cache_mode},
@@ -179,7 +195,7 @@ static json make_vid_gen_defaults_json(const SDGenerationParams& defaults, const
         {"fps", defaults.fps},
         {"moe_boundary", defaults.moe_boundary},
         {"vace_strength", defaults.vace_strength},
-        {"sample_params", make_sample_params_json(defaults.sample_params, defaults.skip_layers)},
+        {"sample_params", make_sample_params_json(defaults.sample_params, defaults.skip_layers, &defaults.custom_sigmas)},
         {"high_noise_sample_params", make_sample_params_json(defaults.high_noise_sample_params, defaults.high_noise_skip_layers)},
         {"hires", make_hires_json(defaults)},
         {"vae_tiling_params", make_vae_tiling_json(defaults.vae_tiling_params)},
@@ -410,6 +426,40 @@ static json make_capabilities_json(ServerRuntime& runtime) {
     return result;
 }
 
+static void remove_ui_image_fields(json& form) {
+    for (const char* key : {"init_image", "end_image", "ref_images", "control_frames", "mask_image", "control_image"}) {
+        form.erase(key);
+    }
+}
+
+static json make_ui_settings_snapshot(const json& body, const char* generation_mode) {
+    json supplied = body.value("ui_settings", json::object());
+    json form = supplied.is_object() && supplied.contains("form") && supplied["form"].is_object()
+                    ? supplied["form"]
+                    : json::object();
+    remove_ui_image_fields(form);
+    return {{"form", std::move(form)}, {"generation_mode", generation_mode}};
+}
+
+static bool valid_webui_settings(const json& settings) {
+    return settings.is_object() && settings.contains("form") && settings["form"].is_object() &&
+           settings.contains("generation_mode") && settings["generation_mode"].is_string() &&
+           (settings["generation_mode"] == "image" || settings["generation_mode"] == "video");
+}
+
+static bool valid_history_stem(const std::string& stem) {
+    if (stem.size() != 19) {
+        return false;
+    }
+    for (size_t i = 0; i < stem.size(); ++i) {
+        const bool separator = i == 4 || i == 7 || i == 10 || i == 13 || i == 16;
+        if (separator ? stem[i] != '-' : (stem[i] < '0' || stem[i] > '9')) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool parse_img_gen_request(const json& body,
                                   ServerRuntime& runtime,
                                   ImgGenJobRequest& request,
@@ -417,7 +467,9 @@ static bool parse_img_gen_request(const json& body,
     request.gen_params = *runtime.default_gen_params;
 
     refresh_lora_cache(runtime);
-    if (!request.gen_params.from_json_str(body.dump(), [&](const std::string& path) {
+    json generation_body = body;
+    generation_body.erase("ui_settings");
+    if (!request.gen_params.from_json_str(generation_body.dump(), [&](const std::string& path) {
             return get_lora_full_path(runtime, path);
         })) {
         error_message = "invalid generation parameters";
@@ -446,7 +498,9 @@ static bool parse_vid_gen_request(const json& body,
     request.gen_params = *runtime.default_gen_params;
 
     refresh_lora_cache(runtime);
-    if (!request.gen_params.from_json_str(body.dump(), [&](const std::string& path) {
+    json generation_body = body;
+    generation_body.erase("ui_settings");
+    if (!request.gen_params.from_json_str(generation_body.dump(), [&](const std::string& path) {
             return get_lora_full_path(runtime, path);
         })) {
         error_message = "invalid generation parameters";
@@ -470,11 +524,351 @@ static bool parse_vid_gen_request(const json& body,
 
 void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
     ServerRuntime* runtime = &rt;
+    static std::mutex webui_settings_mutex;
+    const fs::path webui_settings_path = "sdcpp-webui-settings.json";
+    const fs::path webui_presets_path = "sdcpp-webui-presets.json";
+    const fs::path history_dir = "sdoutput";
 
     svr.Get("/sdcpp/v1/capabilities", [runtime](const httplib::Request&, httplib::Response& res) {
         res.status = 200;
         res.set_content(make_capabilities_json(*runtime).dump(), "application/json");
     });
+
+    svr.Get("/sdcpp/v1/settings", [webui_settings_path](const httplib::Request&, httplib::Response& res) {
+        std::lock_guard<std::mutex> lock(webui_settings_mutex);
+        std::ifstream file(webui_settings_path, std::ios::binary);
+        if (!file) {
+            std::error_code error;
+            if (!fs::exists(webui_settings_path, error) && !error) {
+                res.status = 200;
+                res.set_content(R"({"form":{},"generation_mode":"image"})", "application/json");
+            } else {
+                res.status = 500;
+                res.set_content(R"({"error":"unable to read saved UI settings"})", "application/json");
+            }
+            return;
+        }
+
+        try {
+            json settings = json::parse(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+            if (!settings.is_object() || !settings.contains("form") || !settings["form"].is_object() ||
+                !settings.contains("generation_mode") || !settings["generation_mode"].is_string() ||
+                (settings["generation_mode"] != "image" && settings["generation_mode"] != "video")) {
+                res.status = 500;
+                res.set_content(R"({"error":"saved UI settings are invalid"})", "application/json");
+                return;
+            }
+            res.status = 200;
+            res.set_content(settings.dump(), "application/json");
+        } catch (const json::exception&) {
+            res.status = 500;
+            res.set_content(R"({"error":"saved UI settings are invalid"})", "application/json");
+        }
+    });
+
+    svr.Post("/sdcpp/v1/settings", [webui_settings_path](const httplib::Request& req, httplib::Response& res) {
+        if (req.body.size() > k_max_webui_settings_size) {
+            res.status = 413;
+            res.set_content(R"({"error":"settings payload is too large"})", "application/json");
+            return;
+        }
+        try {
+            json body = json::parse(req.body);
+            if (!body.is_object() || !body.contains("form") || !body["form"].is_object() ||
+                !body.contains("generation_mode") || !body["generation_mode"].is_string()) {
+                res.status = 400;
+                res.set_content(R"({"error":"settings must contain a form object and generation_mode"})", "application/json");
+                return;
+            }
+
+            const std::string generation_mode = body["generation_mode"].get<std::string>();
+            if (generation_mode != "image" && generation_mode != "video") {
+                res.status = 400;
+                res.set_content(R"({"error":"generation_mode must be image or video"})", "application/json");
+                return;
+            }
+
+            json form = body["form"];
+            for (const char* key : {"init_image", "end_image", "ref_images", "control_frames", "mask_image",
+                                    "control_image"}) {
+                form.erase(key);
+            }
+            json settings = {{"form", std::move(form)}, {"generation_mode", generation_mode}};
+
+            std::lock_guard<std::mutex> lock(webui_settings_mutex);
+            std::ofstream file(webui_settings_path, std::ios::binary | std::ios::trunc);
+            if (!file) {
+                res.status = 500;
+                res.set_content(R"({"error":"unable to save UI settings"})", "application/json");
+                return;
+            }
+            file << settings.dump(2);
+            file.flush();
+            if (!file) {
+                res.status = 500;
+                res.set_content(R"({"error":"unable to save UI settings"})", "application/json");
+                return;
+            }
+            res.status = 200;
+            res.set_content(R"({"saved":true})", "application/json");
+        } catch (const json::exception&) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid settings JSON"})", "application/json");
+        }
+    });
+
+    svr.Get("/sdcpp/v1/settings/presets", [webui_presets_path](const httplib::Request&, httplib::Response& res) {
+        std::lock_guard<std::mutex> lock(webui_settings_mutex);
+        std::ifstream file(webui_presets_path, std::ios::binary);
+        json stored_presets = json::object();
+        if (!file) {
+            std::error_code error;
+            if (fs::exists(webui_presets_path, error) || error) {
+                res.status = 500;
+                res.set_content(R"({"error":"unable to read saved settings presets"})", "application/json");
+                return;
+            }
+        } else {
+            try {
+                stored_presets = json::parse(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+            } catch (const json::exception&) {
+                res.status = 500;
+                res.set_content(R"({"error":"saved settings presets are invalid"})", "application/json");
+                return;
+            }
+        }
+        if (!stored_presets.is_object()) {
+            res.status = 500;
+            res.set_content(R"({"error":"saved settings presets are invalid"})", "application/json");
+            return;
+        }
+
+        json presets = json::array();
+        for (auto it = stored_presets.begin(); it != stored_presets.end(); ++it) {
+            if (valid_webui_settings(it.value())) {
+                presets.push_back({{"name", it.key()}, {"settings", it.value()}});
+            }
+        }
+        res.status = 200;
+        res.set_content(json({{"presets", presets}}).dump(), "application/json");
+    });
+
+    svr.Post("/sdcpp/v1/settings/presets", [webui_presets_path](const httplib::Request& req, httplib::Response& res) {
+        if (req.body.size() > k_max_webui_settings_size) {
+            res.status = 413;
+            res.set_content(R"({"error":"settings preset is too large"})", "application/json");
+            return;
+        }
+        try {
+            json body = json::parse(req.body);
+            if (!body.is_object() || !body.contains("name") || !body["name"].is_string() ||
+                !body.contains("settings") || !valid_webui_settings(body["settings"])) {
+                res.status = 400;
+                res.set_content(R"({"error":"preset must contain a name and valid settings"})", "application/json");
+                return;
+            }
+            const std::string name = body["name"].get<std::string>();
+            if (name.empty() || name.size() > 80 || name.find_first_not_of(" \t\r\n") == std::string::npos) {
+                res.status = 400;
+                res.set_content(R"({"error":"preset name must contain 1 to 80 non-space characters"})", "application/json");
+                return;
+            }
+
+            json settings = body["settings"];
+            remove_ui_image_fields(settings["form"]);
+
+            std::lock_guard<std::mutex> lock(webui_settings_mutex);
+            json presets = json::object();
+            std::ifstream existing_file(webui_presets_path, std::ios::binary);
+            if (existing_file) {
+                presets = json::parse(std::istreambuf_iterator<char>(existing_file), std::istreambuf_iterator<char>());
+                if (!presets.is_object()) {
+                    res.status = 500;
+                    res.set_content(R"({"error":"saved settings presets are invalid"})", "application/json");
+                    return;
+                }
+            } else {
+                std::error_code error;
+                if (fs::exists(webui_presets_path, error) || error) {
+                    res.status = 500;
+                    res.set_content(R"({"error":"unable to read saved settings presets"})", "application/json");
+                    return;
+                }
+            }
+            presets[name] = std::move(settings);
+
+            std::ofstream file(webui_presets_path, std::ios::binary | std::ios::trunc);
+            if (!file) {
+                res.status = 500;
+                res.set_content(R"({"error":"unable to save settings preset"})", "application/json");
+                return;
+            }
+            file << presets.dump(2);
+            file.flush();
+            if (!file) {
+                res.status = 500;
+                res.set_content(R"({"error":"unable to save settings preset"})", "application/json");
+                return;
+            }
+            res.status = 200;
+            res.set_content(json({{"saved", true}, {"name", name}}).dump(), "application/json");
+        } catch (const json::exception&) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid settings preset JSON"})", "application/json");
+        }
+    });
+
+    svr.Get("/sdcpp/v1/history", [history_dir](const httplib::Request&, httplib::Response& res) {
+        std::error_code error;
+        if (!fs::exists(history_dir, error)) {
+            if (error) {
+                res.status = 500;
+                res.set_content(R"({"error":"unable to read image history"})", "application/json");
+                return;
+            }
+            res.status = 200;
+            res.set_content(R"({"images":[]})", "application/json");
+            return;
+        }
+
+        std::vector<std::string> filenames;
+        fs::directory_iterator it(history_dir, error);
+        const fs::directory_iterator end;
+        for (; !error && it != end; it.increment(error)) {
+            if (!it->is_regular_file(error) || error) {
+                continue;
+            }
+            const fs::path path = it->path();
+            const std::string stem = path.stem().string();
+            if (path.extension() != ".png" || !valid_history_stem(stem)) {
+                continue;
+            }
+            fs::path settings_path = path;
+            settings_path.replace_extension(".json");
+            if (fs::is_regular_file(settings_path, error) && !error) {
+                filenames.push_back(path.filename().string());
+            }
+        }
+        if (error) {
+            res.status = 500;
+            res.set_content(R"({"error":"unable to read image history"})", "application/json");
+            return;
+        }
+        std::sort(filenames.begin(), filenames.end(), std::greater<std::string>());
+        json images = json::array();
+        for (const auto& filename : filenames) {
+            images.push_back({{"filename", filename}});
+        }
+        res.status = 200;
+        res.set_content(json({{"images", images}}).dump(), "application/json");
+    });
+
+    svr.Get(R"(/sdcpp/v1/history/([0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2})/settings)",
+            [history_dir](const httplib::Request& req, httplib::Response& res) {
+                const std::string stem = req.matches[1].str();
+                if (!valid_history_stem(stem)) {
+                    res.status = 404;
+                    res.set_content(R"({"error":"history entry not found"})", "application/json");
+                    return;
+                }
+                std::ifstream file(history_dir / (stem + ".json"), std::ios::binary);
+                if (!file) {
+                    res.status = 404;
+                    res.set_content(R"({"error":"history settings not found"})", "application/json");
+                    return;
+                }
+                try {
+                    json settings = json::parse(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+                    if (!valid_webui_settings(settings)) {
+                        res.status = 500;
+                        res.set_content(R"({"error":"history settings are invalid"})", "application/json");
+                        return;
+                    }
+                    res.status = 200;
+                    res.set_content(settings.dump(), "application/json");
+                } catch (const json::exception&) {
+                    res.status = 500;
+                    res.set_content(R"({"error":"history settings are invalid"})", "application/json");
+                }
+            });
+
+    svr.Get(R"(/sdcpp/v1/history/([0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}\.png))",
+            [history_dir](const httplib::Request& req, httplib::Response& res) {
+                const std::string filename = req.matches[1].str();
+                const std::string stem = fs::path(filename).stem().string();
+                if (!valid_history_stem(stem)) {
+                    res.status = 404;
+                    res.set_content("history image not found", "text/plain");
+                    return;
+                }
+                const fs::path image_path = history_dir / filename;
+                if (req.has_param("thumbnail")) {
+                    int width = 0;
+                    int height = 0;
+                    int channels = 0;
+                    FreeUniquePtr<uint8_t> image(load_image_from_file(image_path.string().c_str(), width, height, channels, 256, 256, 3));
+                    if (!image) {
+                        res.status = 404;
+                        res.set_content("history image not found", "text/plain");
+                        return;
+                    }
+                    const auto bytes = encode_image_to_vector(EncodedImageFormat::JPEG, image.get(), width, height, channels, "", 82);
+                    if (bytes.empty()) {
+                        res.status = 500;
+                        res.set_content("unable to create image thumbnail", "text/plain");
+                        return;
+                    }
+                    res.set_content(reinterpret_cast<const char*>(bytes.data()), bytes.size(), "image/jpeg");
+                    return;
+                }
+
+                std::ifstream file(image_path, std::ios::binary);
+                if (!file) {
+                    res.status = 404;
+                    res.set_content("history image not found", "text/plain");
+                    return;
+                }
+                std::string bytes{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+                res.set_content(bytes, "image/png");
+            });
+
+    svr.Delete(R"(/sdcpp/v1/history/([0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}\.png))",
+               [history_dir](const httplib::Request& req, httplib::Response& res) {
+                   const std::string filename = req.matches[1].str();
+                   const std::string stem = fs::path(filename).stem().string();
+                   if (!valid_history_stem(stem)) {
+                       res.status = 404;
+                       res.set_content(R"({"error":"history entry not found"})", "application/json");
+                       return;
+                   }
+
+                   const fs::path image_path = history_dir / filename;
+                   std::error_code error;
+                   if (!fs::is_regular_file(image_path, error)) {
+                       res.status = error ? 500 : 404;
+                       res.set_content(error ? R"({"error":"unable to inspect history image"})"
+                                             : R"({"error":"history image not found"})",
+                                       "application/json");
+                       return;
+                   }
+                   if (!fs::remove(image_path, error) || error) {
+                       res.status = 500;
+                       res.set_content(R"({"error":"unable to delete history image"})", "application/json");
+                       return;
+                   }
+
+                   fs::path settings_path = image_path;
+                   settings_path.replace_extension(".json");
+                   fs::remove(settings_path, error);
+                   if (error) {
+                       res.status = 500;
+                       res.set_content(R"({"error":"image deleted but settings sidecar could not be removed"})",
+                                       "application/json");
+                       return;
+                   }
+                   res.status = 200;
+                   res.set_content(R"({"deleted":true})", "application/json");
+               });
 
     svr.Post("/sdcpp/v1/upscale", [runtime](const httplib::Request& req, httplib::Response& res) {
         try {
@@ -669,6 +1063,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->status                             = AsyncJobStatus::Queued;
             job->created_at                         = unix_timestamp_now();
             job->img_gen                            = std::move(request);
+            job->ui_settings_snapshot               = make_ui_settings_snapshot(body, "image");
 
             {
                 std::lock_guard<std::mutex> lock(manager.mutex);

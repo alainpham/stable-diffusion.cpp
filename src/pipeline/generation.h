@@ -1,6 +1,8 @@
 #ifndef __SD_PIPELINE_GENERATION_H__
 #define __SD_PIPELINE_GENERATION_H__
 
+#include <functional>
+
 #include "conditioning/conditioner.hpp"
 #include "stable-diffusion.h"
 
@@ -11,6 +13,8 @@ static inline bool sd_version_supports_animatediff(SDVersion version) {
 }
 
 namespace sd::pipeline {
+
+    using ImageOutputCallback = std::function<void(const sd_image_t&, size_t, size_t)>;
 
     struct ImageGenerationLatents {
         sd::Tensor<float> init_latent;
@@ -54,7 +58,8 @@ namespace sd::pipeline {
     bool generate_image(StableDiffusionGGML* sd,
                         const sd_img_gen_params_t* sd_img_gen_params,
                         sd_image_t** images_out,
-                        int* num_images_out);
+                        int* num_images_out,
+                        const ImageOutputCallback& on_image = {});
 
     bool generate_video(StableDiffusionGGML* sd,
                         const sd_vid_gen_params_t* sd_vid_gen_params,

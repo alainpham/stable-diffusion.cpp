@@ -53,6 +53,14 @@ Native async API for `stable-diffusion.cpp`.
 Current endpoints include:
 
 - `GET /sdcpp/v1/capabilities`
+- `GET /sdcpp/v1/settings`
+- `POST /sdcpp/v1/settings`
+- `GET /sdcpp/v1/settings/presets`
+- `POST /sdcpp/v1/settings/presets`
+- `GET /sdcpp/v1/history`
+- `GET /sdcpp/v1/history/{timestamp}.png`
+- `DELETE /sdcpp/v1/history/{timestamp}.png`
+- `GET /sdcpp/v1/history/{timestamp}/settings`
 - `POST /sdcpp/v1/img_gen`
 - `GET /sdcpp/v1/jobs/{id}`
 - `POST /sdcpp/v1/jobs/{id}/cancel`
@@ -448,6 +456,38 @@ The preview is updated in place as sampling progresses; poll `GET /sdcpp/v1/jobs
 
 ### Endpoints
 
+#### `GET /sdcpp/v1/settings` and `POST /sdcpp/v1/settings`
+
+The web UI loads defaults from `sdcpp-webui-settings.json` in the server's
+working directory when it opens. It saves the current settings there only when
+the user clicks **Set as Default** on the main screen. The saved object contains
+`form` and `generation_mode`; uploaded image data is omitted.
+
+`POST` expects a JSON object with a `form` object and a `generation_mode` of
+`image` or `video`. Settings payloads larger than 1 MiB are rejected.
+
+#### `GET /sdcpp/v1/settings/presets` and `POST /sdcpp/v1/settings/presets`
+
+These endpoints list and save named UI settings presets in
+`sdcpp-webui-presets.json` in the server's working directory. `POST` expects
+`{"name":"Portrait","settings":{"form":{},"generation_mode":"image"}}`;
+saving a preset with an existing name replaces it.
+
+#### Image history
+
+`GET /sdcpp/v1/history` lists saved image filenames in newest-first order.
+`GET /sdcpp/v1/history/{timestamp}.png` serves an image, and adding
+`?thumbnail=1` serves a square thumbnail. `GET /sdcpp/v1/history/{timestamp}/settings`
+returns that image's settings sidecar. `DELETE /sdcpp/v1/history/{timestamp}.png`
+deletes the image and its matching settings sidecar.
+
+Generated images are saved in `sdoutput` in the server's working directory as
+`YYYY-MM-dd-HH-mm-ss.png`, with a same-stem `.json` settings file. If a
+timestamp is already used, the server advances it by one second to avoid
+overwriting an existing image. Each image sidecar records the effective seed
+used for that image, including a resolved positive seed when the requested seed
+was negative.
+
 #### `GET /sdcpp/v1/capabilities`
 
 Returns frontend-friendly capability metadata.
@@ -677,9 +717,19 @@ Response fields:
 | `created` | `integer` |
 | `poll_url` | `string` |
 
+The web UI includes a `ui_settings` snapshot so the server can write the exact
+form values to the image's settings sidecar. On completion,
+`result.images[].filename` contains the saved PNG filename; `result.save_error`
+is populated if image or sidecar saving failed.
+
 #### `GET /sdcpp/v1/jobs/{id}`
 
 Returns current job status.
+
+While an image job is generating, `completed_images` lists the filenames of
+images already saved from the batch. The web UI adds each one to history as it
+appears. The final `result.images` array still contains the completed image
+data and filenames.
 
 Typical status codes:
 

@@ -26,6 +26,12 @@ After the server starts successfully:
 * the web UI is available at `http://127.0.0.1:1234/`
 * the native async API is available under `/sdcpp/v1/...`
 * the compatibility APIs are available under `/v1/...` and `/sdapi/v1/...`
+* click **Set as Default** in the main screen to save generation settings,
+  including prompts, to `sdcpp-webui-settings.json` in the server's working
+  directory; uploaded images are not saved
+* named UI presets are saved to `sdcpp-webui-presets.json` in the same directory
+* generated images and their settings sidecars are saved under `sdoutput/` as
+  timestamped `.png` and `.json` files
 
 If you want to use a different host or port, pass:
 

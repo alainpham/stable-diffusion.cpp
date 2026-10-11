@@ -539,7 +539,10 @@ namespace sd::pipeline {
     static sd_image_t* decode_image_outputs(StableDiffusionGGML* sd,
                                             const GenerationRequest& request,
                                             const std::vector<sd::Tensor<float>>& final_latents,
-                                            int* num_images_out) {
+                                            int* num_images_out,
+                                            const ImageOutputCallback& on_image = {},
+                                            size_t output_index_base = 0,
+                                            size_t batch_index = 0) {
         if (final_latents.empty()) {
             LOG_ERROR("no latent images to decode");
             return nullptr;
@@ -638,6 +641,9 @@ namespace sd::pipeline {
 
         for (size_t i = 0; i < decoded_images.size(); i++) {
             result_images[i] = tensor_to_sd_image(decoded_images[i]);
+            if (on_image) {
+                on_image(result_images[i], output_index_base + i, batch_index);
+            }
         }
 
         return result_images;
@@ -783,7 +789,8 @@ namespace sd::pipeline {
     bool generate_image(StableDiffusionGGML* sd,
                         const sd_img_gen_params_t* sd_img_gen_params,
                         sd_image_t** images_out,
-                        int* num_images_out) {
+                        int* num_images_out,
+                        const ImageOutputCallback& on_image) {
         if (images_out != nullptr) {
             *images_out = nullptr;
         }
@@ -847,6 +854,45 @@ namespace sd::pipeline {
         ImageGenerationEmbeds embeds = std::move(*embeds_opt);
 
         std::vector<sd::Tensor<float>> final_latents;
+        std::unique_ptr<UpscalerGGML> streamed_hires_upscaler;
+        std::vector<float> streamed_hires_sigma_sched;
+        size_t streamed_image_count = 0;
+        if (on_image && request.hires.enabled && request.hires.target_width > 0) {
+            if (request.hires.upscaler == SD_HIRES_UPSCALER_MODEL) {
+                if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
+                    LOG_ERROR("cancelling generation before hires fix");
+                    return false;
+                }
+                LOG_INFO("hires fix: loading model upscaler from '%s'", request.hires.model_path);
+                streamed_hires_upscaler = std::make_unique<UpscalerGGML>(sd->n_threads,
+                                                                        false,
+                                                                        request.hires.upscale_tile_size,
+                                                                        sd->backend_spec,
+                                                                        sd->params_backend_spec);
+                const size_t max_graph_vram_bytes = sd->max_graph_vram_bytes_for_module(SDBackendModule::UPSCALER);
+                streamed_hires_upscaler->set_max_graph_vram_bytes(max_graph_vram_bytes);
+                if (!streamed_hires_upscaler->load_from_file(request.hires.model_path, sd->n_threads)) {
+                    LOG_ERROR("load hires model upscaler failed");
+                    return false;
+                }
+            }
+
+            int hires_scheduler_steps = 0;
+            streamed_hires_sigma_sched = make_hires_sigma_schedule(sd,
+                                                                  request.hires,
+                                                                  sd_img_gen_params->sample_params,
+                                                                  plan.sample_method,
+                                                                  plan.sample_steps,
+                                                                  sd->get_image_seq_len(request.hires.target_height,
+                                                                                        request.hires.target_width),
+                                                                  &hires_scheduler_steps);
+            LOG_INFO("hires fix: scheduler_steps=%d, denoising_strength=%.2f, sigma_sched_size=%zu%s",
+                     hires_scheduler_steps,
+                     request.hires.denoising_strength,
+                     streamed_hires_sigma_sched.size(),
+                     request.hires.custom_sigmas_count > 0 ? ", custom_sigmas=true" : "");
+        }
+
         int64_t denoise_start = ggml_time_ms();
         for (int b = 0; b < request.batch_count; b++) {
             sd_cancel_mode_t cancel = sd->get_cancel_flag();
@@ -855,8 +901,8 @@ namespace sd::pipeline {
                 return false;
             }
             if (cancel == SD_CANCEL_NEW_LATENTS) {
-                LOG_INFO("cancelling new latent generation, returning %zu/%d completed latents",
-                         final_latents.size(),
+                LOG_INFO("cancelling new latent generation, returning %zu/%d completed outputs",
+                         on_image ? streamed_image_count : final_latents.size(),
                          request.batch_count);
                 break;
             }
@@ -897,7 +943,94 @@ namespace sd::pipeline {
             int64_t sampling_end  = ggml_time_ms();
             if (!x_0.empty()) {
                 LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
-                final_latents.push_back(std::move(x_0));
+                if (on_image) {
+                    if (request.hires.enabled && request.hires.target_width > 0) {
+                        if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
+                            LOG_ERROR("cancelling generation during hires fix");
+                            return false;
+                        }
+                        const int64_t cur_seed = request.seed + b;
+                        sd->rng->manual_seed(cur_seed);
+                        sd->sampler_rng->manual_seed(cur_seed);
+
+                        sd::Tensor<float> upscaled = upscale_hires_latent(sd,
+                                                                          x_0,
+                                                                          request,
+                                                                          streamed_hires_upscaler.get());
+                        if (upscaled.empty()) {
+                            return false;
+                        }
+
+                        sd::Tensor<float> noise = sd::randn_like<float>(upscaled, sd->rng);
+                        sd::Tensor<float> hires_denoise_mask;
+                        if (!latents.denoise_mask.empty()) {
+                            std::vector<int64_t> mask_shape = latents.denoise_mask.shape();
+                            mask_shape[0]                   = upscaled.shape()[0];
+                            mask_shape[1]                   = upscaled.shape()[1];
+                            hires_denoise_mask              = sd::ops::interpolate(latents.denoise_mask,
+                                                                                   mask_shape,
+                                                                                   sd::ops::InterpolateMode::NearestMax);
+                        }
+
+                        int64_t hires_sample_start = ggml_time_ms();
+                        sd::Tensor<float> hires_x_0 = sd->sample(sd->diffusion_model,
+                                                                  true,
+                                                                  upscaled,
+                                                                  std::move(noise),
+                                                                  embeds.cond,
+                                                                  embeds.uncond,
+                                                                  embeds.img_uncond,
+                                                                  latents.control_image,
+                                                                  request.control_strength,
+                                                                  request.guidance,
+                                                                  plan.eta,
+                                                                  request.shifted_timestep,
+                                                                  plan.sample_method,
+                                                                  sd->is_flow_denoiser(),
+                                                                  plan.extra_sample_args,
+                                                                  streamed_hires_sigma_sched,
+                                                                  latents.ref_latents,
+                                                                  ref_image_params,
+                                                                  hires_denoise_mask,
+                                                                  sd::Tensor<float>(),
+                                                                  1.f,
+                                                                  0,
+                                                                  static_cast<float>(request.fps),
+                                                                  request.cache_params,
+                                                                  false);
+                        int64_t hires_sample_end = ggml_time_ms();
+                        if (hires_x_0.empty()) {
+                            LOG_ERROR("hires sampling for image %d/%d failed after %.2fs",
+                                      b + 1,
+                                      request.batch_count,
+                                      (hires_sample_end - hires_sample_start) * 1.0f / 1000);
+                            return false;
+                        }
+                        LOG_INFO("hires sampling %d/%d completed, taking %.2fs",
+                                 b + 1,
+                                 request.batch_count,
+                                 (hires_sample_end - hires_sample_start) * 1.0f / 1000);
+                        x_0 = std::move(hires_x_0);
+                    }
+
+                    std::vector<sd::Tensor<float>> batch_latent;
+                    batch_latent.push_back(std::move(x_0));
+                    int num_images = 0;
+                    sd_image_t* images = decode_image_outputs(sd,
+                                                              request,
+                                                              batch_latent,
+                                                              &num_images,
+                                                              on_image,
+                                                              streamed_image_count,
+                                                              static_cast<size_t>(b));
+                    if (images == nullptr) {
+                        return false;
+                    }
+                    streamed_image_count += static_cast<size_t>(num_images);
+                    free_sd_images(images, num_images);
+                } else {
+                    final_latents.push_back(std::move(x_0));
+                }
                 continue;
             }
 
@@ -907,6 +1040,21 @@ namespace sd::pipeline {
                       (sampling_end - sampling_start) * 1.0f / 1000);
             return false;
         }
+
+        if (on_image) {
+            if (streamed_image_count == 0) {
+                LOG_ERROR("no decoded images generated");
+                return false;
+            }
+            if (num_images_out != nullptr) {
+                *num_images_out = static_cast<int>(streamed_image_count);
+            }
+            sd->lora_stat();
+            int64_t t1 = ggml_time_ms();
+            LOG_INFO("generate_image completed in %.2fs", (t1 - t0) * 1.0f / 1000);
+            return true;
+        }
+
         int64_t denoise_end = ggml_time_ms();
         LOG_INFO("generating %zu latent images completed, taking %.2fs",
                  final_latents.size(),

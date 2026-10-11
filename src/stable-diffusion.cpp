@@ -10,6 +10,7 @@
 #include "pipeline/diffusion_engine.h"
 #include "pipeline/generation.h"
 #include "pipeline/request.h"
+#include "stable-diffusion-internal.h"
 
 #define NONE_STR "NONE"
 
@@ -747,6 +748,29 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
     }
     StableDiffusionGGML::ExecutionScope execution(*sd_ctx->sd);
     return execution.ready && sd::pipeline::generate_image(sd_ctx->sd, params, images_out, num_images_out);
+}
+
+SD_API bool sd_generate_image_with_callback(sd_ctx_t* sd_ctx,
+                                            const sd_img_gen_params_t* params,
+                                            int* num_images_out,
+                                            sd_image_output_callback_t callback,
+                                            void* user_data) {
+    if (num_images_out != nullptr) {
+        *num_images_out = 0;
+    }
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || params == nullptr) {
+        return false;
+    }
+
+    sd::pipeline::ImageOutputCallback on_image;
+    if (callback != nullptr) {
+        on_image = [callback, user_data](const sd_image_t& image, size_t output_index, size_t batch_index) {
+            callback(&image, output_index, batch_index, user_data);
+        };
+    }
+
+    StableDiffusionGGML::ExecutionScope execution(*sd_ctx->sd);
+    return execution.ready && sd::pipeline::generate_image(sd_ctx->sd, params, nullptr, num_images_out, on_image);
 }
 
 SD_API bool generate_video(sd_ctx_t* sd_ctx,
