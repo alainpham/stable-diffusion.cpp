@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
@@ -11,8 +12,185 @@
 
 #include "common/common.h"
 #include "common/log.h"
+#include "model_catalog.h"
+
+#include <map>
+#include <set>
 
 namespace fs = std::filesystem;
+
+bool PromptImageCallbackGuard::load_image(const char* source, void* data, const sd_tensor_t** image_out) {
+    auto& guard        = *static_cast<PromptImageCallbackGuard*>(data);
+    const auto& params = guard.params_;
+    const auto it      = params.prompt_images.find(source);
+    if (it == params.prompt_images.end()) {
+        LOG_ERROR("Unknown prompt image ID: %s", source);
+        return false;
+    }
+    guard.image_tensor_ = image_tensor(it->second.get());
+    *image_out          = guard.image_tensor_.get();
+    return *image_out != nullptr;
+}
+
+PromptImageCallbackGuard::PromptImageCallbackGuard(sd_ctx_t* ctx, const SDGenerationParams& params)
+    : ctx_(ctx), params_(params) {
+    sd_set_prompt_image_callback(ctx_, load_image, this);
+}
+
+PromptImageCallbackGuard::~PromptImageCallbackGuard() {
+    sd_set_prompt_image_callback(ctx_, nullptr, nullptr);
+}
+
+bool validate_server_img_gen_request(const ServerRuntime& runtime,
+                                     const ImgGenJobRequest& request,
+                                     std::string& error_message) {
+    auto within_dimension_limit = [&](double value) {
+        if (!std::isfinite(value) || value > k_max_generation_dimension) {
+            error_message = "generation dimensions must not exceed " + std::to_string(k_max_generation_dimension);
+            return false;
+        }
+        return true;
+    };
+    const auto& params = request.gen_params;
+    if ((params.width && !within_dimension_limit(*params.width)) ||
+        (params.height && !within_dimension_limit(*params.height)))
+        return false;
+    if (params.hires_enabled.value_or(false)) {
+        if ((params.hires_width && !within_dimension_limit(*params.hires_width)) ||
+            (params.hires_height && !within_dimension_limit(*params.hires_height)))
+            return false;
+        if (params.hires_width.value_or(0) <= 0 && params.hires_height.value_or(0) <= 0) {
+            // Use the documented library defaults for this resource-policy check only.
+            const float scale = params.hires_scale.value_or(2.f);
+            if (!within_dimension_limit(std::round(params.width.value_or(512) * scale)) ||
+                !within_dimension_limit(std::round(params.height.value_or(512) * scale)))
+                return false;
+        }
+    }
+    if (!request.adetailer_enabled || runtime.default_gen_params->ad_model_path.empty()) {
+        return true;
+    }
+    auto pass_valid = [&](const ServerADetailerPass& pass) {
+        if ((pass.width && !within_dimension_limit(*pass.width)) ||
+            (pass.height && !within_dimension_limit(*pass.height))) {
+            return false;
+        }
+        // Match the native key normalization, but leave full option parsing to ADetailer.
+        auto trim = [](const std::string& text) {
+            const auto first = text.find_first_not_of(" \t\r\n");
+            return first == std::string::npos ? std::string() : text.substr(first, text.find_last_not_of(" \t\r\n") - first + 1);
+        };
+        std::stringstream stream(pass.extra_args);
+        std::string item;
+        while (std::getline(stream, item, ',')) {
+            const auto equals = item.find('=');
+            if (equals == std::string::npos) {
+                continue;
+            }
+            auto key = trim(item.substr(0, equals));
+            std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (key != "inpaint_width" && key != "inpaint_height" && key != "steps") {
+                continue;
+            }
+            const auto value  = trim(item.substr(equals + 1));
+            const int minimum = key == "steps" ? 0 : 1;
+            const int maximum = key == "steps" ? k_max_adetailer_steps : k_max_generation_dimension;
+            try {
+                size_t used      = 0;
+                const int parsed = std::stoi(value, &used);
+                if (used == value.size() && parsed >= minimum && parsed <= maximum) {
+                    continue;
+                }
+            } catch (const std::exception&) {
+            }
+            error_message = "ADetailer " + key + " must be between " + std::to_string(minimum) + " and " + std::to_string(maximum);
+            return false;
+        }
+        return true;
+    };
+    if (request.adetailer_passes.empty()) {
+        ServerADetailerPass pass;
+        pass.extra_args = params.extra_ad_args;
+        return pass_valid(pass);
+    }
+    return std::all_of(request.adetailer_passes.begin(), request.adetailer_passes.end(), pass_valid);
+}
+
+bool apply_server_adetailer(ServerRuntime& runtime,
+                            ImgGenJobRequest& request,
+                            SDImageVec& results) {
+    auto& gen_params          = request.gen_params;
+    const auto& ad_model_path = runtime.default_gen_params->ad_model_path;
+    if (!request.adetailer_enabled || ad_model_path.empty()) {
+        return true;
+    }
+    std::string error_message;
+    if (!validate_server_img_gen_request(runtime, request, error_message)) {
+        LOG_ERROR("%s", error_message.c_str());
+        return false;
+    }
+
+    std::vector<ServerADetailerPass> passes = request.adetailer_passes;
+    if (passes.empty()) {
+        ServerADetailerPass pass;
+        pass.prompt          = gen_params.ad_prompt;
+        pass.negative_prompt = gen_params.ad_negative_prompt;
+        pass.extra_args      = gen_params.extra_ad_args;
+        passes.push_back(std::move(pass));
+    }
+
+    ADetailerCtxPtr ad_ctx(create_sd_adetailer(ad_model_path.c_str(),
+                                               runtime.ctx_params->n_threads,
+                                               runtime.ctx_params->effective_backend.c_str(),
+                                               runtime.ctx_params->effective_params_backend.c_str()));
+    if (ad_ctx == nullptr) {
+        LOG_ERROR("sd_adetailer_create failed");
+        return false;
+    }
+
+    for (const auto& pass : passes) {
+        for (int i = 0; i < results.count(); ++i) {
+            if (results[i].data == nullptr) {
+                continue;
+            }
+            SDOptBuilder ad_options(gen_params.to_image_opt(true).release());
+            ad_options.unset("width");
+            ad_options.unset("height");
+            ad_options.unset("strength");
+            ad_options.set_string("adetail.prompt", pass.prompt);
+            ad_options.set_string("adetail.negative_prompt", pass.negative_prompt);
+            ad_options.set_string("adetail.args", pass.extra_args);
+            ad_options.set_int("seed", generation_seed(results.generation_info(i)));
+            ad_options.set_int("width", pass.width);
+            ad_options.set_int("height", pass.height);
+            ad_options.set_float("strength", pass.strength);
+            if (pass.clip_skip) {
+                ad_options.set_int("clip_skip", pass.clip_skip);
+            }
+            if (pass.automatic_scheduler) {
+                ad_options.set_string("sample.scheduler", "auto");
+            }
+
+            sd_result_t* detailed = nullptr;
+            if (!adetail_sd_image(ad_ctx.get(),
+                                  runtime.sd_ctx,
+                                  results[i],
+                                  ad_options.finish(),
+                                  &detailed) ||
+                detailed == nullptr || sd_result_get_image_count(detailed) <= 0 || sd_tensor_data(sd_result_get_image(detailed, 0)) == nullptr) {
+                sd_result_free(detailed);
+                LOG_ERROR("ADetailer failed for image %d", i + 1);
+                return false;
+            }
+            results.append_generation_info(i, sd_result_get_generation_info(detailed, 0), runtime.ctx_params->lora_model_dir);
+            sd_image_free(&results[i]);
+            results[i] = take_result_image(detailed, 0);
+
+            sd_result_free(detailed);
+        }
+    }
+    return true;
+}
 
 static std::string lower_ascii(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
@@ -196,6 +374,12 @@ ArgOptions SDSvrParams::get_options() {
 
     options.int_options = {
         {"", "--listen-port", "server listen port (default: 1234)", &listen_port},
+        {"", "--max-pending-jobs",
+         "maximum number of pending async jobs (default: 64)",
+         &max_pending_jobs},
+        {"", "--completed-ttl-seconds",
+         "retention time for completed async jobs in seconds (default: 600)",
+         &completed_ttl_seconds},
     };
 
     options.bool_options = {
@@ -210,6 +394,13 @@ ArgOptions SDSvrParams::get_options() {
 
     options.manual_options = {
         {"-h", "--help", "show this help message and exit", on_help_arg},
+        {"", "--model-dir", "model root; repeat to search multiple directories (default: models)",
+         [this](int argc, const char** argv, int index) {
+             if (++index >= argc || argv[index][0] == '\0')
+                 return -1;
+             model_dirs.push_back(argv_to_utf8(index, argv));
+             return 1;
+         }},
     };
     add_log_options(options, log_level);
     return options;
@@ -223,6 +414,16 @@ bool SDSvrParams::validate() {
 
     if (listen_port < 0 || listen_port > 65535) {
         LOG_ERROR("error: listen_port should be in the range [0, 65535]");
+        return false;
+    }
+
+    if (max_pending_jobs <= 0) {
+        LOG_ERROR("error: max_pending_jobs must be greater than 0");
+        return false;
+    }
+
+    if (completed_ttl_seconds < 0) {
+        LOG_ERROR("error: completed_ttl_seconds must be non-negative");
         return false;
     }
 
@@ -246,6 +447,8 @@ std::string SDSvrParams::to_string() const {
         << "  log_level: " << log_level_name(log_level) << ",\n"
         << "  listen_ip: " << listen_ip << ",\n"
         << "  listen_port: \"" << listen_port << "\",\n"
+        << "  max_pending_jobs: " << max_pending_jobs << ",\n"
+        << "  completed_ttl_seconds: " << completed_ttl_seconds << ",\n"
         << "  serve_html_path: \"" << serve_html_path << "\",\n"
         << "}";
     return oss.str();
@@ -253,71 +456,79 @@ std::string SDSvrParams::to_string() const {
 
 void refresh_lora_cache(ServerRuntime& rt) {
     std::vector<LoraEntry> new_cache;
-
-    if (rt.ctx_params->lora_model_dir.empty()) {
-        std::lock_guard<std::mutex> lock(*rt.lora_mutex);
-        rt.lora_cache->clear();
-        return;
-    }
-
-    fs::path lora_dir = fs::u8path(rt.ctx_params->lora_model_dir);
-    std::error_code ec;
-    if (fs::exists(lora_dir, ec) && !ec && fs::is_directory(lora_dir, ec) && !ec) {
-        try {
-            auto it = fs::recursive_directory_iterator(
-                lora_dir,
-                fs::directory_options::skip_permission_denied,
-                ec);
-            auto end = fs::recursive_directory_iterator();
-            while (!ec && it != end) {
-                std::error_code entry_ec;
-                bool is_reg = it->is_regular_file(entry_ec);
-                if (entry_ec || !is_reg) {
-                    it.increment(ec);
-                    continue;
+    std::vector<ModelRoot> directories;
+    if (!rt.ctx_params->lora_model_dir.empty()) {
+        directories.push_back(make_model_root(fs::u8path(rt.ctx_params->lora_model_dir), true));
+    } else {
+        for (const auto& root : get_model_roots(*rt.svr_params)) {
+            try {
+                const auto paths = model_category_directories(root, "loras");
+                for (size_t i = 0; i < paths.size(); ++i) {
+                    if (!model_path_inside(root.path, fs::canonical(paths[i]))) {
+                        LOG_WARN("LoRA directory escapes model directory: %s", paths[i].u8string().c_str());
+                        continue;
+                    }
+                    directories.push_back(make_model_root(paths[i], root.primary && lower_ascii(paths[i].filename().u8string()) == "loras"));
                 }
-                const fs::path& p = it->path();
-                if (!is_supported_model_ext(p)) {
-                    it.increment(ec);
-                    continue;
-                }
-
-                LoraEntry lora_entry;
-                lora_entry.name     = p.stem().u8string();
-                lora_entry.fullpath = p.u8string();
-                std::string rel     = p.lexically_relative(lora_dir).u8string();
-                std::replace(rel.begin(), rel.end(), '\\', '/');
-                lora_entry.path = rel;
-
-                new_cache.push_back(std::move(lora_entry));
-                it.increment(ec);
+            } catch (const std::exception& e) {
+                LOG_WARN("error while finding LoRA directories in %s: %s", root.label.c_str(), e.what());
             }
-        } catch (const std::exception& e) {
-            LOG_WARN("error while scanning lora directory '%s': %s", lora_dir.u8string().c_str(), e.what());
-            return;
         }
     }
-
-    if (ec) {
-        LOG_WARN("error while scanning lora directory '%s': %s", lora_dir.u8string().c_str(), ec.message().c_str());
-        return;
+    std::set<std::string> seen;
+    std::map<std::string, size_t> names;
+    for (const auto& directory : directories) {
+        try {
+            if (!fs::exists(directory.path))
+                continue;
+            for (fs::recursive_directory_iterator it(directory.path), end; it != end; ++it) {
+                std::error_code ec;
+                const auto canonical = fs::canonical(it->path(), ec);
+                if (ec || !model_path_inside(directory.path, canonical)) {
+                    it.disable_recursion_pending();
+                    LOG_WARN("skipping inaccessible LoRA or path outside LoRA directory: %s", it->path().u8string().c_str());
+                    continue;
+                }
+                const auto ext = lower_ascii(it->path().extension().u8string());
+                if (!it->is_regular_file() || (!is_supported_model_ext(it->path()) && ext != ".ckpt" && ext != ".sft") ||
+                    !seen.insert(model_path_key(canonical)).second)
+                    continue;
+                const auto relative = it->path().lexically_relative(directory.path).generic_u8string();
+                LoraEntry entry;
+                entry.name         = it->path().stem().u8string();
+                entry.path         = directory.primary ? relative : directory.id + "/" + relative;
+                entry.fullpath     = it->path().u8string();
+                entry.display_path = relative;
+                entry.root         = directory.path;
+                ++names[relative];
+                new_cache.push_back(std::move(entry));
+            }
+        } catch (const std::exception& e) {
+            LOG_WARN("error while scanning LoRA directory '%s': %s", directory.path.u8string().c_str(), e.what());
+        }
     }
-
+    for (auto& entry : new_cache) {
+        if (names[entry.display_path] > 1)
+            entry.display_path = fs::u8path(entry.fullpath).generic_u8string();
+    }
     std::sort(new_cache.begin(), new_cache.end(), [](const LoraEntry& a, const LoraEntry& b) {
         return a.path < b.path;
     });
-
-    {
-        std::lock_guard<std::mutex> lock(*rt.lora_mutex);
-        *rt.lora_cache = std::move(new_cache);
-    }
+    std::lock_guard<std::mutex> lock(*rt.lora_mutex);
+    *rt.lora_cache = std::move(new_cache);
 }
 
 std::string get_lora_full_path(ServerRuntime& rt, const std::string& path) {
     std::lock_guard<std::mutex> lock(*rt.lora_mutex);
     auto it = std::find_if(rt.lora_cache->begin(), rt.lora_cache->end(),
                            [&](const LoraEntry& entry) { return entry.path == path; });
-    return it != rt.lora_cache->end() ? it->fullpath : "";
+    if (it == rt.lora_cache->end())
+        return "";
+    std::error_code ec;
+    const auto canonical = fs::canonical(fs::u8path(it->fullpath), ec);
+    if (ec || !model_path_inside(it->root, canonical) || !fs::is_regular_file(canonical, ec) || ec)
+        return "";
+    return canonical.u8string();
 }
 
 void refresh_upscaler_cache(ServerRuntime& rt) {
@@ -374,7 +585,7 @@ void refresh_upscaler_cache(ServerRuntime& rt) {
                 });
                 upscaler_entry.image_upscale_factor = previous != previous_cache.end()
                                                           ? previous->image_upscale_factor
-                                                          : get_upscaler_model_scale(upscaler_entry.fullpath.c_str());
+                                                          : sd_upscaler_probe_scale(upscaler_entry.fullpath.c_str());
                 if (upscaler_entry.image_upscale_factor > 0) {
                     upscaler_entry.scale      = upscaler_entry.image_upscale_factor;
                     upscaler_entry.model_name = "ESRGAN_" + std::to_string(upscaler_entry.scale) + "x";
@@ -404,8 +615,8 @@ void refresh_upscaler_cache(ServerRuntime& rt) {
     }
 }
 
-int64_t unix_timestamp_now() {
-    return std::chrono::duration_cast<std::chrono::seconds>(
+int64_t unix_timestamp_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
 }

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -8,7 +10,6 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-
 
 #include "runtime.h"
 
@@ -28,13 +29,25 @@ enum class AsyncJobStatus {
 const char* async_job_kind_name(AsyncJobKind kind);
 const char* async_job_status_name(AsyncJobStatus status);
 
+struct AsyncJobProgress {
+    std::string stage = "queued";
+    std::string detail;
+    std::string unit;
+    int sample_pass                                     = 0;
+    int64_t completed                                   = 0;
+    int64_t total                                       = 0;
+    std::chrono::steady_clock::time_point stage_started = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point finished{};
+};
+
 struct AsyncGenerationJob {
     std::string id;
     AsyncJobKind kind     = AsyncJobKind::ImgGen;
     AsyncJobStatus status = AsyncJobStatus::Queued;
-    int64_t created_at    = unix_timestamp_now();
-    int64_t started_at    = 0;
-    int64_t completed_at  = 0;
+    std::atomic<bool> cancel_requested{false};
+    int64_t created_at   = unix_timestamp_now_ms();
+    int64_t started_at   = 0;
+    int64_t completed_at = 0;
     ImgGenJobRequest img_gen;
     VidGenJobRequest vid_gen;
     json ui_settings_snapshot = json::object();
@@ -42,17 +55,20 @@ struct AsyncGenerationJob {
     std::vector<std::string> result_image_filenames;
     std::vector<std::string> completed_image_filenames;
     std::string image_save_error;
+    json result_generation_info;
     std::string result_media_b64;
     std::string result_media_mime_type;
     int result_frame_count = 0;
     int result_fps         = 0;
     std::string error_code;
     std::string error_message;
+    mutable std::mutex progress_mutex;
+    AsyncJobProgress progress;
     mutable std::mutex preview_mutex;
     std::string preview_b64;
-    int preview_pass          = 0;
-    int preview_step          = 0;
-    int preview_total_steps   = 0;
+    int preview_pass        = 0;
+    int preview_step        = 0;
+    int preview_total_steps = 0;
 };
 
 struct AsyncJobManager {
@@ -78,6 +94,7 @@ bool execute_img_gen_job(ServerRuntime& runtime,
                          std::vector<std::string>& output_images,
                          std::vector<std::string>& output_image_filenames,
                          std::string& image_save_error,
+                         json& output_info,
                          std::string& error_message);
 bool execute_vid_gen_job(ServerRuntime& runtime,
                          AsyncGenerationJob& job,
@@ -85,5 +102,6 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
                          std::string& output_media_mime_type,
                          int& output_frame_count,
                          int& output_fps,
+                         json& output_info,
                          std::string& error_message);
 void async_job_worker(ServerRuntime& runtime);

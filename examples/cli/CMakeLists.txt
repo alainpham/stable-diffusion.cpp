@@ -2,8 +2,10 @@ set(TARGET sd-cli)
 
 add_executable(${TARGET}
     ../common/common.cpp
+    ../common/generation_metadata.cpp
     ../common/log.cpp
     ../common/media_io.cpp
+    ../common/media_metadata.cpp
     image_metadata.cpp
     main.cpp
 )
@@ -12,7 +14,6 @@ if(APPLE)
 endif()
 target_include_directories(${TARGET} PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/.."
-    "${PROJECT_SOURCE_DIR}/src"
 )
 install(TARGETS ${TARGET} RUNTIME)
 target_link_libraries(${TARGET} PRIVATE stable-diffusion zip ${CMAKE_THREAD_LIBS_INIT})

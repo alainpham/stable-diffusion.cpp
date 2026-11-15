@@ -4,6 +4,8 @@
 #include <memory>
 #include <vector>
 
+#include "config.h"
+#include "core/ggml_extend_backend.h"
 #include "model.h"
 #include "stable-diffusion.h"
 
@@ -27,7 +29,7 @@ namespace IPAdapter {
 namespace sd::model_builders {
 
     struct Context {
-        const sd_ctx_params_t& params;
+        const sd::ContextConfig& params;
         SDVersion version;
         const String2TensorStorage& tensor_storage_map;
         SDBackendManager& backends;
@@ -55,6 +57,8 @@ namespace sd::model_builders {
         std::shared_ptr<VAE> preview;
         std::shared_ptr<AudioVAERunner> audio;
     };
+
+    bool ensure_backend_pair(SDBackendManager& backends, SDBackendModule module);
 
     bool build_core_runners(const Context& ctx, CoreRunners& runners);
     bool build_vae_runners(const Context& ctx, const VAEOptions& options, VAERunners& runners);

@@ -1,4 +1,10 @@
 #include "detailer.h"
+#include "api/options.h"
+#include "api/result.h"
+#include "core/option_types.h"
+#include "generation_info.h"
+#include "pipeline/generation.h"
+#include "pipeline/request.h"
 
 #include <algorithm>
 #include <cctype>
@@ -13,8 +19,8 @@
 #include "json.hpp"
 #include "model_loader.h"
 
-struct adetailer_ctx_t {
-    ADetailerGGML* detailer = nullptr;
+struct sd_adetailer {
+    std::unique_ptr<ADetailerGGML> detailer;
 };
 
 struct LetterboxInput {
@@ -94,7 +100,7 @@ static bool parse_float(const std::string& value, float* result) {
     }
 }
 
-static float image_channel(const sd_image_t& image, int x, int y, int channel) {
+static float image_channel(const sd::Image& image, int x, int y, int channel) {
     if (image.data == nullptr || image.width == 0 || image.height == 0 || image.channel == 0) {
         return 0.f;
     }
@@ -105,7 +111,7 @@ static float image_channel(const sd_image_t& image, int x, int y, int channel) {
     return image.data[index] / 255.f;
 }
 
-static float bilinear_channel(const sd_image_t& image, float x, float y, int channel) {
+static float bilinear_channel(const sd::Image& image, float x, float y, int channel) {
     int x0   = static_cast<int>(std::floor(x));
     int y0   = static_cast<int>(std::floor(y));
     int x1   = x0 + 1;
@@ -117,7 +123,7 @@ static float bilinear_channel(const sd_image_t& image, float x, float y, int cha
     return a * (1.f - wy) + b * wy;
 }
 
-static LetterboxInput make_letterbox_input(sd_image_t image, int input_size) {
+static LetterboxInput make_letterbox_input(sd::Image image, int input_size) {
     LetterboxInput result;
     result.tensor      = sd::full<float>({input_size, input_size, 3, 1}, 114.f / 255.f);
     result.scale       = std::min(static_cast<float>(input_size) / image.width,
@@ -178,7 +184,7 @@ static float box_iou(const ADetailerDetection& a, const ADetailerDetection& b) {
 static std::vector<ADetailerDetection> decode_detections(const sd::Tensor<float>& raw,
                                                          const YOLOv8Config& config,
                                                          const LetterboxInput& letterbox,
-                                                         sd_image_t image,
+                                                         sd::Image image,
                                                          const ADetailerParams& params) {
     std::vector<ADetailerDetection> candidates;
     if (raw.empty() || raw.dim() < 2) {
@@ -291,7 +297,9 @@ static void filter_and_sort_detections(std::vector<ADetailerDetection>* detectio
         std::partial_sort(detections->begin(),
                           detections->begin() + params.mask_k_largest,
                           detections->end(),
-                          [](const auto& a, const auto& b) { return detection_area(a) > detection_area(b); });
+                          [&](const auto& a, const auto& b) {
+                              return params.mask_filter_by_confidence ? a.confidence > b.confidence : detection_area(a) > detection_area(b);
+                          });
         detections->resize(params.mask_k_largest);
     }
 
@@ -506,9 +514,9 @@ static CropRegion expand_crop(CropRegion crop,
     return crop;
 }
 
-static sd_image_t resize_crop_image(const sd_image_t& source, const CropRegion& crop, int width, int height) {
-    sd_image_t output = {static_cast<uint32_t>(width), static_cast<uint32_t>(height), 3, nullptr};
-    output.data       = static_cast<uint8_t*>(malloc(static_cast<size_t>(width) * height * 3));
+static sd::Image resize_crop_image(const sd::Image& source, const CropRegion& crop, int width, int height) {
+    sd::Image output = {static_cast<uint32_t>(width), static_cast<uint32_t>(height), 3, nullptr};
+    output.data      = static_cast<uint8_t*>(malloc(static_cast<size_t>(width) * height * 3));
     if (output.data == nullptr) {
         return {0, 0, 0, nullptr};
     }
@@ -527,9 +535,9 @@ static sd_image_t resize_crop_image(const sd_image_t& source, const CropRegion& 
     return output;
 }
 
-static sd_image_t resize_crop_mask(const Mask& source, const CropRegion& crop, int width, int height) {
-    sd_image_t output = {static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1, nullptr};
-    output.data       = static_cast<uint8_t*>(malloc(static_cast<size_t>(width) * height));
+static sd::Image resize_crop_mask(const Mask& source, const CropRegion& crop, int width, int height) {
+    sd::Image output = {static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1, nullptr};
+    output.data      = static_cast<uint8_t*>(malloc(static_cast<size_t>(width) * height));
     if (output.data == nullptr) {
         return {0, 0, 0, nullptr};
     }
@@ -545,13 +553,22 @@ static sd_image_t resize_crop_mask(const Mask& source, const CropRegion& crop, i
     return output;
 }
 
-static sd_image_t copy_as_rgb(const sd_image_t& source) {
+static sd::Image copy_for_detailing(const sd::Image& source) {
+    if (source.channel == 4) {
+        sd::Image output = source;
+        size_t bytes     = static_cast<size_t>(source.width) * source.height * source.channel;
+        output.data      = static_cast<uint8_t*>(malloc(bytes));
+        if (output.data != nullptr) {
+            memcpy(output.data, source.data, bytes);
+        }
+        return output;
+    }
     CropRegion full{0, 0, static_cast<int>(source.width), static_cast<int>(source.height)};
     return resize_crop_image(source, full, source.width, source.height);
 }
 
-static void composite_crop(sd_image_t* destination,
-                           const sd_image_t& generated,
+static void composite_crop(sd::Image* destination,
+                           const sd::Image& generated,
                            const Mask& feather_mask,
                            const CropRegion& crop) {
     int crop_width  = crop.x2 - crop.x1;
@@ -566,7 +583,7 @@ static void composite_crop(sd_image_t* destination,
                 continue;
             }
             float source_x           = (x - crop.x1 + 0.5f) * scale_x - 0.5f;
-            size_t destination_index = (static_cast<size_t>(y) * destination->width + x) * 3;
+            size_t destination_index = (static_cast<size_t>(y) * destination->width + x) * destination->channel;
             for (int c = 0; c < 3; ++c) {
                 float generated_value                    = bilinear_channel(generated, source_x, source_y, c) * 255.f;
                 float original_value                     = destination->data[destination_index + c];
@@ -711,7 +728,7 @@ bool ADetailerGGML::load_from_file(const std::string& detector_path) {
     return true;
 }
 
-std::vector<ADetailerDetection> ADetailerGGML::predict(sd_image_t image,
+std::vector<ADetailerDetection> ADetailerGGML::predict(sd::Image image,
                                                        const ADetailerParams& params) {
     LetterboxInput input  = make_letterbox_input(image, params.input_size);
     int64_t start         = ggml_time_ms();
@@ -745,8 +762,8 @@ std::vector<ADetailerDetection> ADetailerGGML::predict(sd_image_t image,
     return detections;
 }
 
-static bool parse_adetailer_params(const sd_adetailer_params_t& public_params,
-                                   const sd_img_gen_params_t& inpaint_params,
+static bool parse_adetailer_params(const sd::ADetailConfig& public_params,
+                                   const sd::ImageConfig& inpaint_params,
                                    ADetailerParams* params) {
     if (params == nullptr) {
         return false;
@@ -787,6 +804,10 @@ static bool parse_adetailer_params(const sd_adetailer_params_t& public_params,
             ok = parse_int(value, &params->max_detections);
         } else if (key == "mask_k_largest") {
             ok = parse_int(value, &params->mask_k_largest);
+        } else if (key == "mask_filter_method") {
+            const std::string method          = lower_copy(value);
+            ok                                = method == "area" || method == "confidence";
+            params->mask_filter_by_confidence = method == "confidence";
         } else if (key == "mask_min_ratio") {
             ok = parse_float(value, &params->mask_min_ratio);
         } else if (key == "mask_max_ratio") {
@@ -805,6 +826,8 @@ static bool parse_adetailer_params(const sd_adetailer_params_t& public_params,
             ok = parse_int(value, &params->mask_blur);
         } else if (key == "inpaint_padding") {
             ok = parse_int(value, &params->inpaint_padding);
+        } else if (key == "inpaint_only_masked") {
+            ok = parse_bool(value, &params->inpaint_only_masked);
         } else if (key == "inpaint_width") {
             ok = parse_int(value, &params->inpaint_width);
         } else if (key == "inpaint_height") {
@@ -864,48 +887,36 @@ static bool parse_adetailer_params(const sd_adetailer_params_t& public_params,
     return true;
 }
 
-adetailer_ctx_t* new_adetailer_ctx(const char* detector_path,
-                                   int n_threads,
-                                   const char* backend,
-                                   const char* params_backend) {
-    if (detector_path == nullptr || detector_path[0] == '\0') {
-        return nullptr;
-    }
-    auto* context = static_cast<adetailer_ctx_t*>(calloc(1, sizeof(adetailer_ctx_t)));
-    if (context == nullptr) {
-        return nullptr;
-    }
-    context->detailer = new ADetailerGGML(n_threads, SAFE_STR(backend), SAFE_STR(params_backend));
-    if (context->detailer == nullptr || !context->detailer->load_from_file(detector_path)) {
-        delete context->detailer;
-        free(context);
-        return nullptr;
-    }
-    return context;
+sd_status_t sd_adetailer_create(const sd_adetailer_opt_t* opt, sd_adetailer_t** out) {
+    if (out)
+        *out = nullptr;
+    return sd::api::call([&] {
+        if (!out)
+            return sd::api::error(SD_STATUS_INVALID_ARGUMENT, nullptr, "out is required");
+        sd::OptConfig config;
+        auto status = sd::api::resolve(opt, sd::api::ADetailer, config);
+        if (status != SD_STATUS_OK)
+            return status;
+        auto result      = std::make_unique<sd_adetailer_t>();
+        const auto& ctx  = config.context;
+        result->detailer = std::make_unique<ADetailerGGML>(ctx.n_threads, SAFE_STR(ctx.backend), SAFE_STR(ctx.params_backend));
+        if (!result->detailer->load_from_file(ctx.model_path))
+            return sd::api::error(SD_STATUS_LOAD_FAILED, "model_path", "could not load ADetailer");
+        *out = result.release();
+        return SD_STATUS_OK;
+    },
+                         SD_STATUS_LOAD_FAILED);
 }
 
-void free_adetailer_ctx(adetailer_ctx_t* context) {
-    if (context == nullptr) {
-        return;
-    }
-    delete context->detailer;
-    context->detailer = nullptr;
-    free(context);
+void sd_adetailer_free(sd_adetailer_t* adetailer) {
+    delete adetailer;
 }
 
-bool adetail_image(adetailer_ctx_t* context,
-                   sd_ctx_t* sd_ctx,
-                   sd_image_t input_image,
-                   const sd_adetailer_params_t* public_params,
-                   const sd_img_gen_params_t* inpaint_params,
-                   sd_image_t** images_out,
-                   int* num_images_out) {
-    if (images_out != nullptr) {
-        *images_out = nullptr;
-    }
-    if (num_images_out != nullptr) {
-        *num_images_out = 0;
-    }
+static bool run_adetail(sd_adetailer_t* context, sd_ctx_t* sd_ctx, sd::Image input_image, const sd::ADetailConfig* public_params, const sd::ImageConfig* inpaint_params, sd_result_t** result_out, sd_status_t& failure) {
+    if (result_out)
+        *result_out = nullptr;
+    if (!result_out)
+        return false;
     if (context == nullptr || context->detailer == nullptr || sd_ctx == nullptr || public_params == nullptr ||
         inpaint_params == nullptr || input_image.data == nullptr) {
         return false;
@@ -913,18 +924,24 @@ bool adetail_image(adetailer_ctx_t* context,
 
     ADetailerParams params;
     if (!parse_adetailer_params(*public_params, *inpaint_params, &params)) {
+        failure = SD_STATUS_INVALID_ARGUMENT;
         return false;
     }
 
-    auto detections = context->detailer->predict(input_image, params);
+    auto resolved_inpaint = *inpaint_params;
+    resolved_inpaint.seed = sd::pipeline::resolve_seed(resolved_inpaint.seed);
+    const auto info       = sd::adetailer_generation_info(*public_params, resolved_inpaint);
+    auto detections       = context->detailer->predict(input_image, params);
     filter_and_sort_detections(&detections, input_image.width, input_image.height, params);
     auto masks = make_masks(detections, input_image.width, input_image.height, params);
 
-    sd_image_t current = copy_as_rgb(input_image);
+    sd::Image current = copy_for_detailing(input_image);
     if (current.data == nullptr) {
+        failure = SD_STATUS_OUT_OF_MEMORY;
         return false;
     }
 
+    std::unique_ptr<uint8_t, decltype(&free)> current_owner(current.data, &free);
     int applied = 0;
     for (size_t i = 0; i < masks.size(); ++i) {
         std::string prompt          = resolve_prompt(params.prompt, inpaint_params->prompt, static_cast<int>(i));
@@ -939,38 +956,41 @@ bool adetail_image(adetailer_ctx_t* context,
         if (!mask_bbox(masks[i], &crop)) {
             continue;
         }
-        crop                   = expand_crop(crop,
-                                             current.width,
-                                             current.height,
-                                             params.inpaint_padding,
-                                             params.inpaint_width,
-                                             params.inpaint_height);
-        sd_image_t local_image = resize_crop_image(current, crop, params.inpaint_width, params.inpaint_height);
-        sd_image_t local_mask  = resize_crop_mask(masks[i], crop, params.inpaint_width, params.inpaint_height);
+        crop                  = params.inpaint_only_masked ? expand_crop(crop,
+                                                                         current.width,
+                                                                         current.height,
+                                                                         params.inpaint_padding,
+                                                                         params.inpaint_width,
+                                                                         params.inpaint_height)
+                                                           : CropRegion{0, 0, static_cast<int>(current.width), static_cast<int>(current.height)};
+        sd::Image local_image = resize_crop_image(current, crop, params.inpaint_width, params.inpaint_height);
+        sd::Image local_mask  = resize_crop_mask(masks[i], crop, params.inpaint_width, params.inpaint_height);
         if (local_image.data == nullptr || local_mask.data == nullptr) {
+            failure = SD_STATUS_OUT_OF_MEMORY;
             free(local_image.data);
             free(local_mask.data);
-            free(current.data);
             return false;
         }
 
-        sd_img_gen_params_t generation = *inpaint_params;
-        generation.prompt              = prompt.c_str();
-        generation.negative_prompt     = negative_prompt.c_str();
-        generation.init_image          = local_image;
-        generation.mask_image          = local_mask;
-        generation.width               = params.inpaint_width;
-        generation.height              = params.inpaint_height;
-        generation.strength            = params.denoising_strength;
-        generation.seed                = inpaint_params->seed + static_cast<int64_t>(i);
-        generation.batch_count         = 1;
-        generation.ref_images          = nullptr;
-        generation.ref_images_count    = 0;
-        generation.control_image       = {};
-        generation.pm_params           = {};
-        generation.pulid_params        = {};
-        generation.hires.enabled       = false;
-        generation.image_preprocess    = {};
+        sd::ImageConfig generation  = resolved_inpaint;
+        generation.prompt           = prompt.c_str();
+        generation.negative_prompt  = negative_prompt.c_str();
+        generation.init_image       = local_image;
+        generation.mask_image       = local_mask;
+        generation.width            = params.inpaint_width;
+        generation.height           = params.inpaint_height;
+        generation.strength         = params.denoising_strength;
+        generation.seed             = static_cast<int64_t>((static_cast<uint64_t>(resolved_inpaint.seed) + i) & INT64_MAX);
+        generation.batch_count      = 1;
+        generation.ref_images       = nullptr;
+        generation.ref_images_count = 0;
+        generation.control_image    = {};
+        generation.pm_params        = {};
+        generation.pulid_params     = {};
+        generation.hires.enabled    = false;
+        generation.image_preprocess = {};
+
+        generation.sample_params.guidance.img_cfg = INFINITY;
         if (params.steps > 0) {
             generation.sample_params.sample_steps        = params.steps;
             generation.sample_params.custom_sigmas       = nullptr;
@@ -986,37 +1006,62 @@ bool adetail_image(adetailer_ctx_t* context,
             generation.sample_params.scheduler = params.scheduler;
         }
 
-        sd_image_t* generated = nullptr;
-        int generated_count   = 0;
-        bool success          = generate_image(sd_ctx, &generation, &generated, &generated_count);
+        sd::ImageGenerationResult* generated = nullptr;
+        failure                              = sd::generate_image(sd_ctx, generation, &generated);
+        std::unique_ptr<sd::ImageGenerationResult, decltype(&sd::free_image_generation_result)> generated_owner(generated, sd::free_image_generation_result);
         free(local_image.data);
         free(local_mask.data);
-        if (!success || generated_count <= 0 || generated == nullptr || generated[0].data == nullptr) {
-            free_sd_images(generated, generated_count);
-            free(current.data);
+        if (failure != SD_STATUS_OK)
+            return false;
+        if (!generated || generated->count <= 0 || !generated->items[0].image.data) {
+            failure = sd::api::error(SD_STATUS_GENERATION_FAILED, nullptr, "inpainting returned no image");
             return false;
         }
 
         Mask feather = gaussian_blur_mask(masks[i], params.mask_blur);
-        composite_crop(&current, generated[0], feather, crop);
-        free_sd_images(generated, generated_count);
+        composite_crop(&current, generated->items[0].image, feather, crop);
         ++applied;
     }
 
-    auto* outputs = static_cast<sd_image_t*>(calloc(1, sizeof(sd_image_t)));
-    if (outputs == nullptr) {
-        free(current.data);
+    const std::vector<nlohmann::json> infos{info};
+    auto* outputs = static_cast<sd::Image*>(calloc(1, sizeof(sd::Image)));
+    if (!outputs) {
+        failure = SD_STATUS_OUT_OF_MEMORY;
         return false;
     }
     outputs[0] = current;
-    if (images_out != nullptr) {
-        *images_out = outputs;
-    } else {
-        free_sd_images(outputs, 1);
-    }
-    if (num_images_out != nullptr) {
-        *num_images_out = 1;
+    current_owner.release();
+    if (!sd::make_image_result(outputs, 1, infos, result_out)) {
+        failure = SD_STATUS_OUT_OF_MEMORY;
+        return false;
     }
     LOG_INFO("ADetailer applied %d mask(s)", applied);
     return true;
+}
+
+sd_status_t sd_adetail(sd_adetailer_t* adetailer, sd_ctx_t* ctx, const sd_adetail_opt_t* opt, sd_result_t** out) {
+    if (out)
+        *out = nullptr;
+    return sd::api::call([&] {
+        if (!out)
+            return sd::api::error(SD_STATUS_INVALID_ARGUMENT, nullptr, "out is required");
+        sd::OptConfig config;
+        auto status = sd::api::resolve(opt, sd::api::ADetail, config);
+        if (status != SD_STATUS_OK)
+            return status;
+        if (!adetailer || !ctx)
+            return sd::api::error(SD_STATUS_INVALID_ARGUMENT, nullptr, "adetailer and diffusion context are required");
+        if (!sd_ctx_supports_image_generation(ctx))
+            return sd::api::error(SD_STATUS_UNSUPPORTED, nullptr, "inpainting requires an image-generation model");
+        sd_status_t failure = SD_STATUS_GENERATION_FAILED;
+        if (!run_adetail(adetailer, ctx, config.post.image, &config.post.adetail, &config.image, out, failure)) {
+            if (failure == SD_STATUS_OK)
+                failure = SD_STATUS_GENERATION_FAILED;
+            if (*sd_get_last_error())
+                return failure;
+            return sd::api::error(failure, nullptr, "ADetailer failed; see log for details");
+        }
+        return SD_STATUS_OK;
+    },
+                         SD_STATUS_GENERATION_FAILED);
 }

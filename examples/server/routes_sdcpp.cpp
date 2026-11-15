@@ -15,13 +15,14 @@
 #include "common/common.h"
 #include "common/media_io.h"
 #include "common/resource_owners.hpp"
+#include "model_catalog.h"
 
 namespace fs = std::filesystem;
 
-static constexpr uint32_t k_max_upscale_dimension = 8192;
+static constexpr uint32_t k_max_upscale_dimension      = 8192;
 static constexpr std::size_t k_max_webui_settings_size = 1024 * 1024;
 
-static bool valid_upscale_dimensions(const sd_image_t& image, int factor, int repeats) {
+static bool valid_upscale_dimensions(const SDImage& image, int factor, int repeats) {
     if (image.width == 0 || image.height == 0 || factor < 1 || repeats < 1 || repeats > 4) {
         return false;
     }
@@ -37,51 +38,20 @@ static bool valid_upscale_dimensions(const sd_image_t& image, int factor, int re
     return true;
 }
 
-static bool parse_cache_mode(const std::string& mode_str, sd_cache_mode_t& mode_out) {
-    if (mode_str == "disabled") {
-        mode_out = SD_CACHE_DISABLED;
-        return true;
-    }
-    if (mode_str == "easycache") {
-        mode_out = SD_CACHE_EASYCACHE;
-        return true;
-    }
-    if (mode_str == "ucache") {
-        mode_out = SD_CACHE_UCACHE;
-        return true;
-    }
-    if (mode_str == "dbcache") {
-        mode_out = SD_CACHE_DBCACHE;
-        return true;
-    }
-    if (mode_str == "taylorseer") {
-        mode_out = SD_CACHE_TAYLORSEER;
-        return true;
-    }
-    if (mode_str == "cache-dit") {
-        mode_out = SD_CACHE_CACHE_DIT;
-        return true;
-    }
-    if (mode_str == "spectrum") {
-        mode_out = SD_CACHE_SPECTRUM;
-        return true;
-    }
-    return false;
+static bool parse_cache_mode(const std::string& value, std::string& mode) {
+    const std::string canonical = value == "cache-dit" ? "cache_dit" : value;
+    SDOptPtr opt(sd_img_gen_opt_create());
+    if (!opt || sd_opt_set_string(opt.get(), "cache.mode", canonical.c_str()) != SD_STATUS_OK)
+        return false;
+    mode = canonical;
+    return true;
 }
 
-static json finite_number_or_null(float value) {
-    return std::isfinite(value) ? json(value) : json(nullptr);
+static json finite_number_or_null(const std::optional<float>& value) {
+    return value && std::isfinite(*value) ? json(*value) : json(nullptr);
 }
 
-static const char* capability_scheduler_name(enum scheduler_t scheduler) {
-    return scheduler < SCHEDULER_COUNT ? sd_scheduler_name(scheduler) : "default";
-}
-
-static const char* capability_sample_method_name(enum sample_method_t sample_method) {
-    return sample_method < SAMPLE_METHOD_COUNT ? sd_sample_method_name(sample_method) : "default";
-}
-
-static json make_vae_tiling_json(const sd_tiling_params_t& params) {
+static json make_vae_tiling_json(const SDTilingParams& params) {
     return {
         {"enabled", params.enabled},
         {"temporal_tiling", params.temporal_tiling},
@@ -105,21 +75,13 @@ static fs::path resolve_display_model_path(const ServerRuntime& runtime) {
     return {};
 }
 
-static json make_sample_params_json(const sd_sample_params_t& sample_params,
-                                    const std::vector<int>& skip_layers,
-                                    const std::vector<float>* custom_sigmas = nullptr) {
+static json make_sample_params_json(const SDSampleParams& sample_params, const std::optional<std::vector<int>>& skip_layers, const std::optional<std::vector<float>>& custom_sigmas = {}) {
     const auto& guidance = sample_params.guidance;
-    json custom_sigmas_json = json::array();
-    if (custom_sigmas != nullptr) {
-        for (float sigma : *custom_sigmas) {
-            custom_sigmas_json.push_back(sigma);
-        }
-    }
     return {
-        {"scheduler", capability_scheduler_name(sample_params.scheduler)},
-        {"sample_method", capability_sample_method_name(sample_params.sample_method)},
+        {"scheduler", sample_params.scheduler},
+        {"sample_method", sample_params.sample_method},
         {"sample_steps", sample_params.sample_steps},
-        {"custom_sigmas", custom_sigmas_json},
+        {"custom_sigmas", custom_sigmas ? json(*custom_sigmas) : json::array()},
         {"eta", finite_number_or_null(sample_params.eta)},
         {"shifted_timestep", sample_params.shifted_timestep},
         {"flow_shift", finite_number_or_null(sample_params.flow_shift)},
@@ -158,8 +120,8 @@ static json make_img_gen_defaults_json(const SDGenerationParams& defaults, const
         {"prompt", defaults.prompt},
         {"negative_prompt", defaults.negative_prompt},
         {"clip_skip", defaults.clip_skip},
-        {"width", defaults.width > 0 ? defaults.width : 512},
-        {"height", defaults.height > 0 ? defaults.height : 512},
+        {"width", defaults.width},
+        {"height", defaults.height},
         {"strength", defaults.strength},
         {"seed", defaults.seed},
         {"batch_count", defaults.batch_count},
@@ -168,8 +130,9 @@ static json make_img_gen_defaults_json(const SDGenerationParams& defaults, const
         {"image_preprocess", defaults.image_preprocess},
         {"increase_ref_index", defaults.increase_ref_index},
         {"control_strength", defaults.control_strength},
+        {"control_type", defaults.control_type},
         {"ip_adapter_strength", defaults.ip_adapter_strength},
-        {"sample_params", make_sample_params_json(defaults.sample_params, defaults.skip_layers, &defaults.custom_sigmas)},
+        {"sample_params", make_sample_params_json(defaults.sample_params, defaults.skip_layers, defaults.custom_sigmas)},
         {"hires", make_hires_json(defaults)},
         {"vae_tiling_params", make_vae_tiling_json(defaults.vae_tiling_params)},
         {"cache_mode", defaults.cache_mode},
@@ -186,16 +149,17 @@ static json make_vid_gen_defaults_json(const SDGenerationParams& defaults, const
         {"prompt", defaults.prompt},
         {"negative_prompt", defaults.negative_prompt},
         {"clip_skip", defaults.clip_skip},
-        {"width", defaults.width > 0 ? defaults.width : 512},
-        {"height", defaults.height > 0 ? defaults.height : 512},
+        {"width", defaults.width},
+        {"height", defaults.height},
         {"strength", defaults.strength},
         {"seed", defaults.seed},
         {"video_frames", defaults.video_frames},
         {"image_preprocess", defaults.image_preprocess},
+        {"ref_image_args", defaults.ref_image_args},
         {"fps", defaults.fps},
         {"moe_boundary", defaults.moe_boundary},
         {"vace_strength", defaults.vace_strength},
-        {"sample_params", make_sample_params_json(defaults.sample_params, defaults.skip_layers, &defaults.custom_sigmas)},
+        {"sample_params", make_sample_params_json(defaults.sample_params, defaults.skip_layers, defaults.custom_sigmas)},
         {"high_noise_sample_params", make_sample_params_json(defaults.high_noise_sample_params, defaults.high_noise_skip_layers)},
         {"hires", make_hires_json(defaults)},
         {"vae_tiling_params", make_vae_tiling_json(defaults.vae_tiling_params)},
@@ -220,34 +184,39 @@ static json make_img_gen_features_json() {
         {"hires", true},
         {"cache", true},
         {"cancel_queued", true},
-        {"cancel_generating", false},
+        {"cancel_generating", true},
         {"preview", true},
     };
 }
 
+/** Builds the default feature set advertised for vid_gen requests. */
 static json make_vid_gen_features_json() {
     return {
         {"init_image", true},
         {"end_image", true},
         {"control_frames", true},
+        {"ref_videos", true},
+        {"ref_audios", true},
+        {"ref_video_audios", true},
         {"high_noise_sample_params", true},
         {"lora", true},
         {"vae_tiling", true},
         {"cache", true},
         {"cancel_queued", true},
-        {"cancel_generating", false},
+        {"cancel_generating", true},
         {"preview", true},
     };
 }
 
 static json make_preview_modes_json() {
     json modes = json::array();
-    for (int i = 0; i < PREVIEW_COUNT; ++i) {
-        modes.push_back(sd_preview_name((preview_t)i));
+    for (const char* name : example_options::preview_modes) {
+        modes.push_back(name);
     }
     return modes;
 }
 
+/** Builds the /capabilities payload: model, defaults, limits and feature maps. */
 static json make_capabilities_json(ServerRuntime& runtime) {
     refresh_lora_cache(runtime);
     refresh_upscaler_cache(runtime);
@@ -265,13 +234,13 @@ static json make_capabilities_json(ServerRuntime& runtime) {
     json available_upscalers  = json::array();
     json supported_modes      = json::array();
 
-    for (int i = 0; i < SAMPLE_METHOD_COUNT; ++i) {
-        samplers.push_back(sd_sample_method_name((sample_method_t)i));
+    for (const char* name : example_options::sample_methods) {
+        samplers.push_back(name);
     }
 
-    for (int i = 0; i < SCHEDULER_COUNT; ++i) {
-        schedulers.push_back(sd_scheduler_name((scheduler_t)i));
-        if (i == DISCRETE_SCHEDULER) {
+    for (const std::string name : example_options::schedulers) {
+        schedulers.push_back(name);
+        if (name == "discrete") {
             schedulers.push_back("normal");
         }
     }
@@ -282,6 +251,7 @@ static json make_capabilities_json(ServerRuntime& runtime) {
             available_loras.push_back({
                 {"name", entry.name},
                 {"path", entry.path},
+                {"display_path", entry.display_path},
             });
         }
     }
@@ -360,25 +330,43 @@ static json make_capabilities_json(ServerRuntime& runtime) {
         default_vid_output_format = video_output_formats[0].get<std::string>();
     }
 
+    const json generation_features = model_generation_features(runtime);
+    auto recipe_features           = [&](json features, bool video) {
+        features["init_image"] = generation_features.at(video ? "init_image" : "img2img");
+        for (const char* key : {"mask_image", "ref_images", "end_image", "control_frames", "ref_videos", "ref_audios", "ref_video_audios", "lora", "vae_tiling", "cache", "preview"}) {
+            if (features.contains(key) || std::string(key) == "ref_images" ||
+                (video && (std::string(key) == "ref_videos" || std::string(key) == "ref_audios" ||
+                           std::string(key) == "ref_video_audios")))
+                features[key] = generation_features.at(key);
+        }
+        if (video)
+            features["high_noise_sample_params"] = generation_features.at("high_noise");
+        else {
+            features["mask_image"]       = generation_features.at("mask_image").get<bool>() && generation_features.at("img2img").get<bool>();
+            features["control_image"]    = generation_features.at("controlnet").get<bool>() || generation_features.at("control_image").get<bool>();
+            features["ip_adapter_image"] = generation_features.at("ip_adapter");
+        }
+        return features;
+    };
     json defaults_by_mode       = json::object();
     json output_formats_by_mode = json::object();
     json features_by_mode       = json::object();
     if (supports_img) {
         defaults_by_mode["img_gen"]       = make_img_gen_defaults_json(defaults, default_img_output_format);
         output_formats_by_mode["img_gen"] = image_output_formats;
-        features_by_mode["img_gen"]       = make_img_gen_features_json();
+        features_by_mode["img_gen"]       = recipe_features(make_img_gen_features_json(), false);
     }
     if (supports_vid) {
         defaults_by_mode["vid_gen"]       = make_vid_gen_defaults_json(defaults, default_vid_output_format);
         output_formats_by_mode["vid_gen"] = video_output_formats;
-        features_by_mode["vid_gen"]       = make_vid_gen_features_json();
+        features_by_mode["vid_gen"]       = recipe_features(make_vid_gen_features_json(), true);
     }
 
     json top_level_defaults       = json::object();
     json top_level_output_formats = json::array();
     json top_level_features       = {
-              {"cancel_queued", true},
-              {"cancel_generating", false},
+        {"cancel_queued", true},
+        {"cancel_generating", true},
     };
     std::string current_mode = "";
     if (supports_img) {
@@ -399,19 +387,21 @@ static json make_capabilities_json(ServerRuntime& runtime) {
         {"stem", model_path.stem().u8string()},
         {"path", model_path.u8string()},
     };
-    result["current_mode"]     = current_mode;
-    result["supported_modes"]  = supported_modes;
-    result["defaults"]         = top_level_defaults;
-    result["defaults_by_mode"] = defaults_by_mode;
-    result["limits"]           = {
-                  {"min_width", 64},
-                  {"max_width", 4096},
-                  {"min_height", 64},
-                  {"max_height", 4096},
-                  {"max_batch_count", 8},
-                  {"max_queue_size", manager.max_pending_jobs},
-                  {"max_upscale_width", k_max_upscale_dimension},
-                  {"max_upscale_height", k_max_upscale_dimension},
+    result["generation_features"] = generation_features;
+    result["runtime"]             = model_status(runtime);
+    result["current_mode"]        = current_mode;
+    result["supported_modes"]     = supported_modes;
+    result["defaults"]            = top_level_defaults;
+    result["defaults_by_mode"]    = defaults_by_mode;
+    result["limits"]              = {
+        {"min_width", 64},
+        {"max_width", k_max_generation_dimension},
+        {"min_height", 64},
+        {"max_height", k_max_generation_dimension},
+        {"max_batch_count", 8},
+        {"max_queue_size", manager.max_pending_jobs},
+        {"max_upscale_width", k_max_upscale_dimension},
+        {"max_upscale_height", k_max_upscale_dimension},
     };
     result["samplers"]               = samplers;
     result["schedulers"]             = schedulers;
@@ -427,16 +417,16 @@ static json make_capabilities_json(ServerRuntime& runtime) {
 }
 
 static void remove_ui_image_fields(json& form) {
-    for (const char* key : {"init_image", "end_image", "ref_images", "control_frames", "mask_image", "control_image"}) {
+    for (const char* key : {"init_image", "end_image", "ref_images", "control_frames", "mask_image", "control_image", "ip_adapter_image", "ref_video", "ref_audio", "ref_videos", "ref_audios"}) {
         form.erase(key);
     }
 }
 
 static json make_ui_settings_snapshot(const json& body, const char* generation_mode) {
     json supplied = body.value("ui_settings", json::object());
-    json form = supplied.is_object() && supplied.contains("form") && supplied["form"].is_object()
-                    ? supplied["form"]
-                    : json::object();
+    json form     = supplied.is_object() && supplied.contains("form") && supplied["form"].is_object()
+                        ? supplied["form"]
+                        : json::object();
     remove_ui_image_fields(form);
     return {{"form", std::move(form)}, {"generation_mode", generation_mode}};
 }
@@ -488,7 +478,7 @@ static bool parse_img_gen_request(const json& body,
         error_message = "invalid generation parameters";
         return false;
     }
-    return true;
+    return validate_server_img_gen_request(runtime, request, error_message);
 }
 
 static bool parse_vid_gen_request(const json& body,
@@ -506,6 +496,21 @@ static bool parse_vid_gen_request(const json& body,
         error_message = "invalid generation parameters";
         return false;
     }
+
+    auto& params                   = request.gen_params;
+    auto merge_shared_sample_input = [&](const char* key, auto member) {
+        const auto base = body.find("sample_params");
+        const auto high = body.find("high_noise_sample_params");
+        if (base != body.end() && base->is_object() && base->contains(key)) {
+            if (base->at(key).is_null())
+                (params.high_noise_sample_params.*member).reset();
+        } else if (high != body.end() && high->is_object() && high->contains(key)) {
+            params.sample_params.*member = params.high_noise_sample_params.*member;
+        }
+    };
+    merge_shared_sample_input("scheduler", &SDSampleParams::scheduler);
+    merge_shared_sample_input("flow_shift", &SDSampleParams::flow_shift);
+    merge_shared_sample_input("shifted_timestep", &SDSampleParams::shifted_timestep);
 
     std::string output_format = body.value("output_format", "webm");
     int output_compression    = body.value("output_compression", 100);
@@ -526,10 +531,11 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
     ServerRuntime* runtime = &rt;
     static std::mutex webui_settings_mutex;
     const fs::path webui_settings_path = "sdcpp-webui-settings.json";
-    const fs::path webui_presets_path = "sdcpp-webui-presets.json";
-    const fs::path history_dir = "sdoutput";
+    const fs::path webui_presets_path  = "sdcpp-webui-presets.json";
+    const fs::path history_dir         = "sdoutput";
+    RuntimeRoutes routes(svr, rt);
 
-    svr.Get("/sdcpp/v1/capabilities", [runtime](const httplib::Request&, httplib::Response& res) {
+    routes.get("/sdcpp/v1/capabilities", [runtime](const httplib::Request&, httplib::Response& res) {
         res.status = 200;
         res.set_content(make_capabilities_json(*runtime).dump(), "application/json");
     });
@@ -589,10 +595,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             }
 
             json form = body["form"];
-            for (const char* key : {"init_image", "end_image", "ref_images", "control_frames", "mask_image",
-                                    "control_image"}) {
-                form.erase(key);
-            }
+            remove_ui_image_fields(form);
             json settings = {{"form", std::move(form)}, {"generation_mode", generation_mode}};
 
             std::lock_guard<std::mutex> lock(webui_settings_mutex);
@@ -738,7 +741,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             if (!it->is_regular_file(error) || error) {
                 continue;
             }
-            const fs::path path = it->path();
+            const fs::path path    = it->path();
             const std::string stem = path.stem().string();
             if (path.extension() != ".png" || !valid_history_stem(stem)) {
                 continue;
@@ -795,7 +798,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
     svr.Get(R"(/sdcpp/v1/history/([0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}\.png))",
             [history_dir](const httplib::Request& req, httplib::Response& res) {
                 const std::string filename = req.matches[1].str();
-                const std::string stem = fs::path(filename).stem().string();
+                const std::string stem     = fs::path(filename).stem().string();
                 if (!valid_history_stem(stem)) {
                     res.status = 404;
                     res.set_content("history image not found", "text/plain");
@@ -803,8 +806,8 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 }
                 const fs::path image_path = history_dir / filename;
                 if (req.has_param("thumbnail")) {
-                    int width = 0;
-                    int height = 0;
+                    int width    = 0;
+                    int height   = 0;
                     int channels = 0;
                     FreeUniquePtr<uint8_t> image(load_image_from_file(image_path.string().c_str(), width, height, channels, 256, 256, 3));
                     if (!image) {
@@ -835,7 +838,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
     svr.Delete(R"(/sdcpp/v1/history/([0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}\.png))",
                [history_dir](const httplib::Request& req, httplib::Response& res) {
                    const std::string filename = req.matches[1].str();
-                   const std::string stem = fs::path(filename).stem().string();
+                   const std::string stem     = fs::path(filename).stem().string();
                    if (!valid_history_stem(stem)) {
                        res.status = 404;
                        res.set_content(R"({"error":"history entry not found"})", "application/json");
@@ -870,7 +873,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                    res.set_content(R"({"deleted":true})", "application/json");
                });
 
-    svr.Post("/sdcpp/v1/upscale", [runtime](const httplib::Request& req, httplib::Response& res) {
+    routes.post("/sdcpp/v1/upscale", [runtime](const httplib::Request& req, httplib::Response& res) {
         try {
             if (req.body.empty()) {
                 res.status = 400;
@@ -891,7 +894,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 const bool valid  = value.is_number_unsigned()
                                         ? value.get<uint64_t>() <= static_cast<uint64_t>(std::numeric_limits<int>::max())
                                         : value.is_number_integer() && value.get<int64_t>() >= std::numeric_limits<int>::min() &&
-                                             value.get<int64_t>() <= std::numeric_limits<int>::max();
+                                              value.get<int64_t>() <= std::numeric_limits<int>::max();
                 if (!valid) {
                     res.status = 400;
                     res.set_content(json({{"error", std::string(key) + " must be a 32-bit integer"}}).dump(), "application/json");
@@ -909,7 +912,12 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 res.set_content(json({{"error", error_message}}).dump(), "application/json");
                 return;
             }
-            const int tile_size      = std::max(32, body.value("tile_size", runtime->default_gen_params->upscale_tile_size));
+            const auto tile_size = body.value("tile_size", runtime->default_gen_params->upscale_tile_size);
+            if (tile_size && *tile_size < 32) {
+                res.status = 400;
+                res.set_content(json({{"error", "tile_size must be at least 32"}}).dump(), "application/json");
+                return;
+            }
             const int repeats        = std::clamp(body.value("repeats", 1), 1, 4);
             const std::string wanted = body.value("upscaler", std::string());
 
@@ -960,18 +968,18 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
 
             // One GPU: an upscale must not run while a generation is using it.
             std::lock_guard<std::mutex> ctx_lock(*runtime->sd_ctx_mutex);
-            UpscalerCtxPtr upscaler_ctx(new_upscaler_ctx(model_path.c_str(),
-                                                         runtime->ctx_params->diffusion_conv_direct,
-                                                         runtime->ctx_params->n_threads,
-                                                         tile_size,
-                                                         runtime->ctx_params->backend.c_str(),
-                                                         runtime->ctx_params->params_backend.c_str()));
+            UpscalerCtxPtr upscaler_ctx(create_sd_upscaler(model_path.c_str(),
+                                                           runtime->ctx_params->diffusion_conv_direct,
+                                                           runtime->ctx_params->n_threads,
+                                                           tile_size,
+                                                           runtime->ctx_params->backend ? runtime->ctx_params->backend->c_str() : nullptr,
+                                                           runtime->ctx_params->params_backend ? runtime->ctx_params->params_backend->c_str() : nullptr));
             if (upscaler_ctx == nullptr) {
                 res.status = 500;
                 res.set_content(R"({"error":"the upscaler model could not be loaded"})", "application/json");
                 return;
             }
-            const int factor = get_upscale_factor(upscaler_ctx.get());
+            const int factor = sd_upscaler_get_scale(upscaler_ctx.get());
             // The model file may have changed since its metadata was cached.
             if (!valid_upscale_dimensions(input.get(), factor, repeats)) {
                 res.status = 400;
@@ -980,34 +988,35 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             }
 
             SDImageOwner current(input.release());
+            std::string generation_info;
             for (int i = 0; i < repeats; ++i) {
-                sd_image_t* out_images = nullptr;
-                int out_count          = 0;
-                if (!upscale(upscaler_ctx.get(), current.get(), (uint32_t)factor, &out_images, &out_count) ||
-                    out_count <= 0 || out_images[0].data == nullptr) {
-                    free_sd_images(out_images, out_count);
+                sd_result_t* generated = nullptr;
+                if (!upscale_sd_image(upscaler_ctx.get(), current.get(), &generated) ||
+                    !generated || sd_result_get_image_count(generated) <= 0 || sd_tensor_data(sd_result_get_image(generated, 0)) == nullptr) {
+                    sd_result_free(generated);
                     res.status = 500;
                     res.set_content(R"({"error":"upscale failed"})", "application/json");
                     return;
                 }
-                sd_image_t produced = out_images[0];
-                out_images[0]       = {0, 0, 0, nullptr};
-                free_sd_images(out_images, out_count);
+                generation_info  = merge_generation_info(generation_info, sd_result_get_generation_info(generated, 0));
+                SDImage produced = take_result_image(generated, 0);
+
+                sd_result_free(generated);
                 current.reset(produced);
             }
 
             const std::string& format = output_options.output_format;
             const int compression     = output_options.output_compression;
-            const sd_image_t result   = current.get();
+            const SDImage result      = current.get();
             auto image_bytes          = encode_image_to_vector(format == "jpeg"   ? EncodedImageFormat::JPEG
                                                                : format == "webp" ? EncodedImageFormat::WEBP
                                                                                   : EncodedImageFormat::PNG,
-                                                      result.data,
-                                                      result.width,
-                                                      result.height,
-                                                      result.channel,
-                                                      "",
-                                                      compression);
+                                                               result.data,
+                                                               result.width,
+                                                               result.height,
+                                                               result.channel,
+                                                               generation_info,
+                                                               compression);
             if (image_bytes.empty()) {
                 res.status = 500;
                 res.set_content(R"({"error":"the result could not be encoded"})", "application/json");
@@ -1015,13 +1024,14 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             }
 
             json out;
-            out["upscaler"]      = used_name;
-            out["scale"]         = factor;
-            out["repeats"]       = repeats;
-            out["width"]         = result.width;
-            out["height"]        = result.height;
-            out["output_format"] = format;
-            json images          = json::array();
+            out["generation_info"] = json::parse(generation_info);
+            out["upscaler"]        = used_name;
+            out["scale"]           = factor;
+            out["repeats"]         = repeats;
+            out["width"]           = result.width;
+            out["height"]          = result.height;
+            out["output_format"]   = format;
+            json images            = json::array();
             images.push_back({{"index", 0}, {"b64_json", base64_encode(image_bytes)}});
             out["images"] = std::move(images);
             res.set_content(out.dump(), "application/json");
@@ -1035,7 +1045,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         }
     });
 
-    svr.Post("/sdcpp/v1/img_gen", [runtime](const httplib::Request& req, httplib::Response& res) {
+    routes.post("/sdcpp/v1/img_gen", [runtime](const httplib::Request& req, httplib::Response& res) {
         try {
             if (req.body.empty()) {
                 res.status = 400;
@@ -1061,7 +1071,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             std::shared_ptr<AsyncGenerationJob> job = std::make_shared<AsyncGenerationJob>();
             job->kind                               = AsyncJobKind::ImgGen;
             job->status                             = AsyncJobStatus::Queued;
-            job->created_at                         = unix_timestamp_now();
+            job->created_at                         = unix_timestamp_now_ms();
             job->img_gen                            = std::move(request);
             job->ui_settings_snapshot               = make_ui_settings_snapshot(body, "image");
 
@@ -1098,7 +1108,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         }
     });
 
-    svr.Post("/sdcpp/v1/vid_gen", [runtime](const httplib::Request& req, httplib::Response& res) {
+    routes.post("/sdcpp/v1/vid_gen", [runtime](const httplib::Request& req, httplib::Response& res) {
         try {
             if (req.body.empty()) {
                 res.status = 400;
@@ -1124,7 +1134,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             std::shared_ptr<AsyncGenerationJob> job = std::make_shared<AsyncGenerationJob>();
             job->kind                               = AsyncJobKind::VidGen;
             job->status                             = AsyncJobStatus::Queued;
-            job->created_at                         = unix_timestamp_now();
+            job->created_at                         = unix_timestamp_now_ms();
             job->vid_gen                            = std::move(request);
 
             {
@@ -1160,7 +1170,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         }
     });
 
-    svr.Get(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+))", [runtime](const httplib::Request& req, httplib::Response& res) {
+    routes.get(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+))", [runtime](const httplib::Request& req, httplib::Response& res) {
         AsyncJobManager& manager = *runtime->async_job_manager;
         std::lock_guard<std::mutex> lock(manager.mutex);
         purge_expired_jobs(manager);
@@ -1182,7 +1192,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         res.set_content(make_async_job_json(manager, *it->second).dump(), "application/json");
     });
 
-    svr.Post(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+)/cancel)", [runtime](const httplib::Request& req, httplib::Response& res) {
+    routes.post(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+)/cancel)", [runtime](const httplib::Request& req, httplib::Response& res) {
         AsyncJobManager& manager = *runtime->async_job_manager;
         std::lock_guard<std::mutex> lock(manager.mutex);
         purge_expired_jobs(manager);
@@ -1213,8 +1223,9 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         }
 
         if (job.status == AsyncJobStatus::Generating) {
-            res.status = 409;
-            res.set_content(R"({"error":"job is currently generating and cannot be interrupted yet"})", "application/json");
+            job.cancel_requested.store(true);
+            res.status = 200;
+            res.set_content(make_async_job_json(manager, job).dump(), "application/json");
             return;
         }
 

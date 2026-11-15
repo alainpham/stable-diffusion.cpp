@@ -1,4 +1,7 @@
 #include "request.h"
+#include "conditioning/conditioner.hpp"
+#include "config.h"
+#include "core/option_types.h"
 
 #include <algorithm>
 #include <cmath>
@@ -6,6 +9,9 @@
 #include <ctime>
 
 #include "diffusion_engine.h"
+#include "generation.h"
+#include "model/vae/vae.hpp"
+#include "model_definition.h"
 #include "runtime/denoiser.hpp"
 
 namespace sd::pipeline {
@@ -43,15 +49,8 @@ namespace sd::pipeline {
     }
 
     enum sample_method_t default_sample_method(const StableDiffusionGGML* sd) {
-        if (sd != nullptr) {
-            if (sd_version_is_pid(sd->version)) {
-                return LCM_SAMPLE_METHOD;
-            }
-            if (sd_version_is_dit(sd->version)) {
-                return EULER_SAMPLE_METHOD;
-            }
-        }
-        return EULER_A_SAMPLE_METHOD;
+        const auto* definition = sd ? find_model_definition(sd->version) : nullptr;
+        return definition ? definition->sampling.default_sample_method : EULER_A_SAMPLE_METHOD;
     }
 
     enum scheduler_t default_scheduler(const StableDiffusionGGML* sd, enum sample_method_t sample_method) {
@@ -65,21 +64,14 @@ namespace sd::pipeline {
             return LCM_SCHEDULER;
         } else if (sample_method == DDIM_TRAILING_SAMPLE_METHOD) {
             return SIMPLE_SCHEDULER;
-        } else if (sd != nullptr && (sd_version_is_flux(sd->version) || sd->version == VERSION_QWEN_IMAGE_2_1)) {
-            return FLUX_SCHEDULER;
-        } else if (sd != nullptr && sd_version_is_flux2(sd->version)) {
-            return FLUX2_SCHEDULER;
-        } else if (sd != nullptr && sd_version_is_ltxav(sd->version)) {
-            return LTX2_SCHEDULER;
-        } else if (sd != nullptr && sd_version_is_ideogram4(sd->version)) {
-            return LOGIT_NORMAL_SCHEDULER;
-        } else if (sd != nullptr && sd_version_is_llada_image(sd->version)) {
-            return LLADA_IMAGE_SCHEDULER;
+        }
+        if (const auto* definition = sd ? find_model_definition(sd->version) : nullptr) {
+            return definition->sampling.default_scheduler;
         }
         return DISCRETE_SCHEDULER;
     }
 
-    static int64_t resolve_seed(int64_t seed) {
+    int64_t resolve_seed(int64_t seed) {
         if (seed >= 0) {
             return seed;
         }
@@ -103,9 +95,9 @@ namespace sd::pipeline {
         return scheduler;
     }
 
-    float resolve_eta(StableDiffusionGGML* sd,
-                      float eta,
-                      enum sample_method_t sample_method) {
+    static float resolve_eta(StableDiffusionGGML* sd,
+                             float eta,
+                             enum sample_method_t sample_method) {
         if (eta == INFINITY) {
             if (sd->version == VERSION_HIDREAM_O1) {
                 return 8.f;
@@ -130,7 +122,7 @@ namespace sd::pipeline {
         return eta;
     }
 
-    GenerationRequest::GenerationRequest(StableDiffusionGGML* sd, const sd_img_gen_params_t* sd_img_gen_params) {
+    GenerationRequest::GenerationRequest(StableDiffusionGGML* sd, const sd::ImageConfig* sd_img_gen_params) {
         prompt                      = SAFE_STR(sd_img_gen_params->prompt);
         negative_prompt             = SAFE_STR(sd_img_gen_params->negative_prompt);
         width                       = sd_img_gen_params->width;
@@ -140,21 +132,32 @@ namespace sd::pipeline {
         seed                        = sd_img_gen_params->seed;
         batch_count                 = sd_img_gen_params->batch_count;
         qwen_image_layers           = std::max(0, sd_img_gen_params->qwen_image_layers);
+        is_layered_image            = sd->version == VERSION_QWEN_IMAGE_LAYERED;
         clip_skip                   = sd_img_gen_params->clip_skip;
         shifted_timestep            = sd_img_gen_params->sample_params.shifted_timestep;
         strength                    = sd_img_gen_params->strength;
         control_strength            = sd_img_gen_params->control_strength;
-        eta                         = sd_img_gen_params->sample_params.eta;
+        control_type                = sd_img_gen_params->control_type;
         has_ref_images              = sd_img_gen_params->ref_images_count > 0;
         guidance                    = sd_img_gen_params->sample_params.guidance;
         pm_params                   = sd_img_gen_params->pm_params;
         pulid_params                = sd_img_gen_params->pulid_params;
         hires                       = sd_img_gen_params->hires;
+        vae_tiling_params           = sd_img_gen_params->vae_tiling_params;
         cache_params                = &sd_img_gen_params->cache;
+        sample_params               = sd_img_gen_params->sample_params;
         resolve(sd);
+        if (!sd_img_gen_params->control_image.data)
+            models.erase("control_net");
+        if (!sd_img_gen_params->ip_adapter_image.data)
+            models.erase("ip_adapter");
+        if (!pm_params.id_images || pm_params.id_images_count <= 0)
+            models.erase("photo_maker");
+        if (!pulid_params.id_embedding_path || !*pulid_params.id_embedding_path)
+            models.erase("pulid_weights");
     }
 
-    GenerationRequest::GenerationRequest(StableDiffusionGGML* sd, const sd_vid_gen_params_t* sd_vid_gen_params) {
+    GenerationRequest::GenerationRequest(StableDiffusionGGML* sd, const sd::VideoConfig* sd_vid_gen_params) {
         prompt           = SAFE_STR(sd_vid_gen_params->prompt);
         negative_prompt  = SAFE_STR(sd_vid_gen_params->negative_prompt);
         width            = sd_vid_gen_params->width;
@@ -179,12 +182,25 @@ namespace sd::pipeline {
         guidance                    = sd_vid_gen_params->sample_params.guidance;
         high_noise_guidance         = sd_vid_gen_params->high_noise_sample_params.guidance;
         hires                       = sd_vid_gen_params->hires;
+        vae_tiling_params           = sd_vid_gen_params->vae_tiling_params;
+        sample_params               = sd_vid_gen_params->sample_params;
+        high_noise_sample_params    = sd_vid_gen_params->high_noise_sample_params;
+        use_high_noise              = sd->high_noise_diffusion_model != nullptr;
+        use_vace                    = sd->diffusion_model && (sd->diffusion_model->get_desc() == "Wan2.1-VACE-1.3B" ||
+                                                              sd->diffusion_model->get_desc() == "Wan2.x-VACE-14B");
+        shifted_timestep            = sample_params.shifted_timestep;
+        if (sd->config_ && sd->config_->animatediff_loaded && sd_version_supports_animatediff(sd->version))
+            frames = std::min(requested_frames, 32);
         resolve(sd);
+        models.erase("control_net");
+        models.erase("ip_adapter");
+        models.erase("photo_maker");
+        models.erase("pulid_weights");
         if (frames != requested_frames) {
             LOG_WARN("align video frames from %d to %d for %s",
                      requested_frames,
                      frames,
-                     model_version_to_str[sd->version]);
+                     sd_version_name(sd->version));
         }
     }
 
@@ -212,6 +228,10 @@ namespace sd::pipeline {
                  *target_width,
                  *target_height,
                  spatial_multiple);
+    }
+
+    int64_t GenerationRequest::seed_for_batch(int index) const {
+        return static_cast<int64_t>((static_cast<uint64_t>(seed) + index) & INT64_MAX);
     }
 
     void GenerationRequest::resolve_hires() {
@@ -274,7 +294,7 @@ namespace sd::pipeline {
     }
 
     void GenerationRequest::resolve_guidance(StableDiffusionGGML* sd,
-                                             sd_guidance_params_t* guidance,
+                                             sd::GuidanceConfig* guidance,
                                              bool* use_uncond,
                                              bool* use_img_uncond,
                                              bool has_ref_images,
@@ -320,9 +340,35 @@ namespace sd::pipeline {
     }
 
     void GenerationRequest::resolve(StableDiffusionGGML* sd) {
+        if (sd->config_) {
+            models = sd->config_->models;
+            if (!use_high_noise)
+                models.erase("high_noise_diffusion_model");
+            if (!sd->clip_vision)
+                models.erase("clip_vision");
+            if (!sd->audio_vae_model || frames <= 0)
+                models.erase("audio_vae");
+            if (!sd->audio_encoder || frames <= 0)
+                models.erase("audio_encoder");
+            if (!sd->config_->animatediff_loaded || !sd_version_supports_animatediff(sd->version) || frames <= 0)
+                models.erase("motion_module");
+            if (sd->uses_tae() && !sd->tae_preview_only())
+                models.erase("vae");
+            else
+                models.erase("taesd");
+        }
+        if (sd_version_is_minit2i(sd->version) && (width != 512 || height != 512)) {
+            width  = 512;
+            height = 512;
+            LOG_WARN("align to fixed size 512x512 for MiniT2I");
+        }
         align_generation_request_size();
         resolve_hires();
+        if (sd->first_stage_model)
+            vae_tiling_params = sd->first_stage_model->resolve_tiling_params(vae_tiling_params);
         seed = resolve_seed(seed);
+        if (sd->cond_stage_model)
+            clip_skip = sd->cond_stage_model->resolve_clip_skip(clip_skip);
 
         resolve_guidance(sd, &guidance, &use_uncond, &use_img_uncond, has_ref_images);
         if (sd->high_noise_diffusion_model) {
@@ -338,40 +384,55 @@ namespace sd::pipeline {
             LOG_WARN("timestep shifting is only supported for SDXL models!");
             shifted_timestep = 0;
         }
+        sample_params.guidance         = guidance;
+        sample_params.shifted_timestep = shifted_timestep;
+        sample_params.sample_method    = resolve_sample_method(sd, sample_params.sample_method);
+        sample_params.scheduler        = resolve_scheduler(sd, sample_params.scheduler, sample_params.sample_method);
+        sample_params.eta              = resolve_eta(sd, sample_params.eta, sample_params.sample_method);
+        sd->set_flow_shift(sample_params.flow_shift);
+        if (sd->is_flow_denoiser())
+            sample_params.flow_shift = sd->active_flow_shift;
+        if (frames > 0) {
+            high_noise_sample_params.guidance         = high_noise_guidance;
+            high_noise_sample_params.sample_method    = resolve_sample_method(sd, high_noise_sample_params.sample_method);
+            high_noise_sample_params.scheduler        = sample_params.scheduler;
+            high_noise_sample_params.flow_shift       = sample_params.flow_shift;
+            high_noise_sample_params.shifted_timestep = sample_params.shifted_timestep;
+            high_noise_sample_params.eta              = resolve_eta(sd, high_noise_sample_params.eta, high_noise_sample_params.sample_method);
+        }
     }
 
     SamplePlan::SamplePlan(StableDiffusionGGML* sd,
-                           const sd_img_gen_params_t* sd_img_gen_params,
+                           const sd::ImageConfig* sd_img_gen_params,
                            const GenerationRequest& request) {
-        sample_method     = sd_img_gen_params->sample_params.sample_method;
-        extra_sample_args = sd_img_gen_params->sample_params.extra_sample_args;
-        eta               = sd_img_gen_params->sample_params.eta;
-        sample_steps      = sd_img_gen_params->sample_params.sample_steps;
-        resolve(sd, &request, &sd_img_gen_params->sample_params);
+        sample_method     = request.sample_params.sample_method;
+        extra_sample_args = request.sample_params.extra_sample_args;
+        eta               = request.sample_params.eta;
+        sample_steps      = request.sample_params.sample_steps;
+        resolve(sd, &request, &request.sample_params);
     }
 
     SamplePlan::SamplePlan(StableDiffusionGGML* sd,
-                           const sd_vid_gen_params_t* sd_vid_gen_params,
+                           const sd::VideoConfig* sd_vid_gen_params,
                            const GenerationRequest& request) {
-        sample_method     = sd_vid_gen_params->sample_params.sample_method;
-        extra_sample_args = sd_vid_gen_params->sample_params.extra_sample_args;
-        eta               = sd_vid_gen_params->sample_params.eta;
-        sample_steps      = sd_vid_gen_params->sample_params.sample_steps;
+        sample_method     = request.sample_params.sample_method;
+        extra_sample_args = request.sample_params.extra_sample_args;
+        eta               = request.sample_params.eta;
+        sample_steps      = request.sample_params.sample_steps;
         if (sd->high_noise_diffusion_model) {
-            high_noise_sample_steps      = sd_vid_gen_params->high_noise_sample_params.sample_steps;
-            high_noise_sample_method     = sd_vid_gen_params->high_noise_sample_params.sample_method;
-            high_noise_extra_sample_args = sd_vid_gen_params->high_noise_sample_params.extra_sample_args;
-            high_noise_eta               = sd_vid_gen_params->high_noise_sample_params.eta;
+            high_noise_sample_steps      = request.high_noise_sample_params.sample_steps;
+            high_noise_sample_method     = request.high_noise_sample_params.sample_method;
+            high_noise_extra_sample_args = request.high_noise_sample_params.extra_sample_args;
+            high_noise_eta               = request.high_noise_sample_params.eta;
         }
         moe_boundary = sd_vid_gen_params->moe_boundary;
-        resolve(sd, &request, &sd_vid_gen_params->sample_params);
+        resolve(sd, &request, &request.sample_params);
     }
 
     void SamplePlan::resolve(StableDiffusionGGML* sd,
                              const GenerationRequest* request,
-                             const sd_sample_params_t* sample_params) {
-        sample_method = resolve_sample_method(sd, sample_method);
-
+                             const sd::SampleConfig* sample_params) {
+        scheduler   = sample_params->scheduler;
         total_steps = sample_steps + std::max(0, high_noise_sample_steps);
 
         if (sample_params->custom_sigmas_count > 0) {
@@ -390,10 +451,7 @@ namespace sd::pipeline {
                 }
             }
         } else {
-            scheduler_t scheduler = resolve_scheduler(sd,
-                                                      sample_params->scheduler,
-                                                      sample_method);
-            int sample_seq_len    = sd->get_image_seq_len(request->height, request->width);
+            int sample_seq_len = sd->get_image_seq_len(request->height, request->width);
             if (sd_version_is_ltxav(sd->version) && request->frames > 0) {
                 int latent_frames = ((request->frames - 1) / 8) + 1;
                 sample_seq_len *= latent_frames;
@@ -407,8 +465,6 @@ namespace sd::pipeline {
                                               sample_params->extra_sample_args);
         }
 
-        eta = resolve_eta(sd, eta, sample_method);
-
         if (high_noise_sample_steps < 0) {
             for (size_t i = 0; i < sigmas.size(); ++i) {
                 if (sigmas[i] < moe_boundary) {
@@ -421,17 +477,13 @@ namespace sd::pipeline {
 
         LOG_INFO("sampling using %s method", sampling_methods_str[sample_method]);
         if (high_noise_sample_steps > 0) {
-            high_noise_sample_method = resolve_sample_method(sd,
-                                                             high_noise_sample_method);
-            high_noise_eta           = resolve_eta(sd, high_noise_eta, high_noise_sample_method);
             LOG_INFO("sampling(high noise) using %s method", sampling_methods_str[high_noise_sample_method]);
         }
     }
 
     std::vector<float> make_hires_sigma_schedule(StableDiffusionGGML* sd,
-                                                 const sd_hires_params_t& hires,
-                                                 const sd_sample_params_t& sample_params,
-                                                 sample_method_t sample_method,
+                                                 const sd::HiresConfig& hires,
+                                                 const sd::SampleConfig& sample_params,
                                                  int default_steps,
                                                  int sample_seq_len,
                                                  int* scheduler_steps_out) {
@@ -456,22 +508,16 @@ namespace sd::pipeline {
         int scheduler_steps = static_cast<int>(effective_steps / hires.denoising_strength);
         scheduler_steps     = std::max(1, scheduler_steps);
 
-        scheduler_t scheduler     = resolve_scheduler(sd,
-                                                      sample_params.scheduler,
-                                                      sample_method);
+        scheduler_t scheduler     = sample_params.scheduler;
         std::vector<float> sigmas = sd->denoiser->get_sigmas(scheduler_steps,
                                                              sample_seq_len,
                                                              scheduler,
                                                              sd->version,
                                                              sample_params.extra_sample_args);
-        size_t t_enc              = static_cast<size_t>(scheduler_steps * hires.denoising_strength);
-        if (t_enc >= static_cast<size_t>(scheduler_steps)) {
-            t_enc = static_cast<size_t>(scheduler_steps) - 1;
-        }
         if (scheduler_steps_out != nullptr) {
             *scheduler_steps_out = scheduler_steps;
         }
-        return std::vector<float>(sigmas.begin() + scheduler_steps - static_cast<int>(t_enc) - 1,
+        return std::vector<float>(sigmas.begin() + std::max(0, scheduler_steps - effective_steps),
                                   sigmas.end());
     }
 

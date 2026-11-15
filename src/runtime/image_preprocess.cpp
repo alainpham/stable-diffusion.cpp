@@ -6,6 +6,42 @@
 
 namespace sd {
 
+    std::pair<int, int> select_image_size_bucket(int source_width, int source_height, int area, int factor, int fallback_width, int fallback_height) {
+        int width               = fallback_width;
+        int height              = fallback_height;
+        double ratio            = static_cast<double>(source_width) / source_height;
+        double best_crop        = INFINITY;
+        int64_t best_area_error = INT64_MAX;
+        int min_size            = 4 * factor;
+        for (int w = min_size; w < 2LL * area / min_size; w += factor) {
+            for (int h = min_size; h < 2LL * area / w; h += factor) {
+                int64_t pixels = int64_t(w) * h;
+                if (pixels < 0.9 * area || pixels > 1.1 * area) {
+                    continue;
+                }
+                double candidate_ratio = static_cast<double>(w) / h;
+                double crop            = std::round((1.0 - std::min(candidate_ratio / ratio, ratio / candidate_ratio)) * 1e9);
+                int64_t area_error     = std::abs(pixels - area);
+                if (crop < best_crop || (crop == best_crop && (area_error < best_area_error || (area_error == best_area_error && w > width)))) {
+                    width           = w;
+                    height          = h;
+                    best_crop       = crop;
+                    best_area_error = area_error;
+                }
+            }
+        }
+        return {width, height};
+    }
+
+    Tensor<float> resize_and_center_crop(const Tensor<float>& image, int width, int height, ops::InterpolateMode filter) {
+        double scale = std::max(static_cast<double>(width) / image.shape()[0], static_cast<double>(height) / image.shape()[1]);
+        int w        = static_cast<int>(std::ceil(image.shape()[0] * scale));
+        int h        = static_cast<int>(std::ceil(image.shape()[1] * scale));
+        auto resized = ops::interpolate(image, {w, h, image.shape()[2], image.shape()[3]}, filter);
+        resized      = ops::slice(resized, 0, (w - width) / 2, (w - width) / 2 + width);
+        return ops::slice(resized, 1, (h - height) / 2, (h - height) / 2 + height);
+    }
+
     static constexpr std::pair<const char*, ImageTarget> image_targets[] = {
         {"init", ImageTarget::Init},
         {"end", ImageTarget::End},
@@ -160,7 +196,7 @@ namespace sd {
         return options;
     }
 
-    bool ImagePreprocessor::validate_inputs(const sd_img_gen_params_t& params) const {
+    bool ImagePreprocessor::validate_inputs(const sd::ImageConfig& params) const {
         const std::map<ImageTarget, int> counts = {
             {ImageTarget::Init, params.init_image.data != nullptr},
             {ImageTarget::Mask, params.mask_image.data != nullptr},
@@ -179,7 +215,7 @@ namespace sd {
         return valid_;
     }
 
-    bool ImagePreprocessor::validate_inputs(const sd_vid_gen_params_t& params) const {
+    bool ImagePreprocessor::validate_inputs(const sd::VideoConfig& params) const {
         const std::map<ImageTarget, int> counts = {
             {ImageTarget::Init, params.init_image.data != nullptr},
             {ImageTarget::End, params.end_image.data != nullptr},
@@ -334,7 +370,7 @@ namespace sd {
         return apply_transform(image, options, p, label, default_filter);
     }
 
-    Tensor<float> ImagePreprocessor::preprocess_input(sd_image_t image, ImageTarget target, int index, int width, int height) {
+    Tensor<float> ImagePreprocessor::preprocess_input(sd::Image image, ImageTarget target, int index, int width, int height) {
         if (image.data == nullptr || image.width == 0 || image.height == 0 || image.width > INT_MAX || image.height > INT_MAX || image.channel < 1 || image.channel > 4) {
             fail(std::string(enum_name(target, image_targets)) + ": invalid input image");
             return {};
@@ -343,8 +379,13 @@ namespace sd {
         if (target == ImageTarget::Mask && has_init_transform_) {
             auto options = resolve_options(target, index);
             if (image.width != init_transform_.source_width || image.height != init_transform_.source_height) {
-                fail("mask and init source dimensions must match");
-                return {};
+                ImagePreprocessor alignment;
+                tensor = alignment.apply_geometry(tensor, target, index, init_transform_.source_width, init_transform_.source_height,
+                                                  ImageResizeMode::CropResize, ops::InterpolateMode::NearestExact);
+                if (tensor.empty()) {
+                    fail("could not align mask to init source dimensions");
+                    return {};
+                }
             }
             bool geometry_override = options.count("width") || options.count("anchor") ||
                                      (options.count("mode") && options.at("mode") != "auto");
@@ -378,7 +419,7 @@ namespace sd {
             std::free(image.data);
     }
 
-    bool ImagePreprocessor::prepare_image(sd_image_t& image, ImageTarget target, int index, int width, int height) {
+    bool ImagePreprocessor::prepare_image(sd::Image& image, ImageTarget target, int index, int width, int height) {
         if (image.data == nullptr)
             return true;
         auto options = resolve_options(target, index);
@@ -390,13 +431,13 @@ namespace sd {
         if (output.data == nullptr)
             return fail("could not allocate input preprocessing buffer");
         owned_images_.push_back(output);
-        if (canny && !preprocess_canny(output, 0.08f, 0.08f, 0.8f, 1.f, false))
+        if (canny && !sd::preprocess_canny(output, 0.08f, 0.08f, 0.8f, 1.f, false))
             return fail("Canny preprocessing failed");
         image = output;
         return true;
     }
 
-    bool ImagePreprocessor::prepare_array(sd_image_t*& images, int count, ImageTarget target, std::vector<sd_image_t>& storage, int width, int height) {
+    bool ImagePreprocessor::prepare_array(sd::Image*& images, int count, ImageTarget target, std::vector<sd::Image>& storage, int width, int height) {
         if (count < 0 || (count > 0 && images == nullptr))
             return fail(std::string("invalid image array: ") + enum_name(target, image_targets));
         if (count == 0)
@@ -412,7 +453,7 @@ namespace sd {
         return true;
     }
 
-    bool ImagePreprocessor::prepare_inputs(sd_img_gen_params_t& params, int width, int height) {
+    bool ImagePreprocessor::prepare_inputs(sd::ImageConfig& params, int width, int height) {
         if (prepared_)
             return fail("inputs have already been prepared");
         prepared_ = true;
@@ -429,7 +470,7 @@ namespace sd {
         return true;
     }
 
-    bool ImagePreprocessor::prepare_inputs(sd_vid_gen_params_t& params, int width, int height) {
+    bool ImagePreprocessor::prepare_inputs(sd::VideoConfig& params, int width, int height) {
         if (prepared_)
             return fail("inputs have already been prepared");
         prepared_ = true;
